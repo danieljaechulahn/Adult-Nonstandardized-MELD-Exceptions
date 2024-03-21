@@ -1,0 +1,72 @@
+---
+title: "Generalized C-Indices"
+author: "Daniel Ahn"
+date: "2024-03-21"
+output: html_document
+---
+
+``` {r c-indices with bootstrapping}
+
+require(rsample)
+require(risksetROC)
+allocationmodel <- coxph(Surv(TIME1, TIME2, NEW_DEATH) ~ ALLOCATION_SCORE, data = timeseriesdata)
+timeseriesdata$allocation_predict <- predict(allocationmodel, timeseriesdata)
+get_allocation_c <- function(data) {
+  r <- risksetAUC(
+    Stime = data$TIME2,
+    entry = data$TIME1,
+    status = data$NEW_DEATH,
+    marker = data$allocation_predict,
+    method = "Cox",
+    tmax = 365,
+    plot = F)
+  return(r$Cindex)
+}
+
+timeseriesdata_short1 <- timeseriesdata[ ,c("PX_ID", "TIME1", "TIME2", "NEW_DEATH", "allocation_predict")]
+timeseriesdata_nest1 <- timeseriesdata_short1 %>% nest(data = -PX_ID)
+
+set.seed(200)
+get_allocation_c(timeseriesdata)
+
+n_iterations <- 500
+bs <- rsample::bootstraps(timeseriesdata_nest1, times = n_iterations)
+auc_allocation <- vector(length = n_iterations)
+
+for (i in 1:n_iterations) {
+  result_allocation_c <- as.tibble(bs$splits[[i]]) %>% unnest() %>% as.data.frame()
+  auc_allocation[i] <- get_allocation_c(result_allocation_c)
+}
+
+
+
+laboratorymodel <- coxph(Surv(TIME1, TIME2, NEW_DEATH) ~ LAB_SCORE, data = timeseriesdata)
+timeseriesdata$laboratory_predict <- predict(laboratorymodel, timeseriesdata)
+get_laboratory_c <- function(data) {
+  r <- risksetAUC(
+    Stime = data$TIME2,
+    entry = data$TIME1,
+    status = data$NEW_DEATH,
+    marker = data$laboratory_predict,
+    method = "Cox",
+    tmax = 365,
+    plot = F)
+  return(r$Cindex)
+}
+
+timeseriesdata_short2 <- timeseriesdata[ ,c("PX_ID", "TIME1", "TIME2", "NEW_DEATH", "laboratory_predict")]
+timeseriesdata_nest2 <- timeseriesdata_short2 %>% nest(data = -PX_ID)
+
+set.seed(200)
+get_laboratory_c(timeseriesdata)
+
+n_iterations <- 500
+bs <- rsample::bootstraps(timeseriesdata_nest2, times = n_iterations)
+auc_laboratory <- vector(length = n_iterations)
+
+for (i in 1:n_iterations) {
+  result_laboratory_c <- as.tibble(bs$splits[[i]]) %>% unnest() %>% as.data.frame()
+  auc_laboratory[i] <- get_laboratory_c(result_laboratory_c)
+}
+
+```

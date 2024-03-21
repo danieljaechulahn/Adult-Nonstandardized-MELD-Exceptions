@@ -1,0 +1,101 @@
+---
+title: "Table 1"
+author: "Daniel Ahn"
+date: "2024-03-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r Table 1}
+
+library(gtsummary)
+
+fortable1 <- finaldataset %>% ungroup() %>%
+  mutate(age = CAN_AGE_AT_LISTING,
+         agegroup = case_when(
+           CAN_AGE_AT_LISTING < 65 ~ "18-64 Years",
+           CAN_AGE_AT_LISTING >= 65 ~ "65 Years or Older"),
+         agegroup = factor(agegroup, levels = c("18-64 Years", "65 Years or Older")),
+         sex = ifelse(CAN_GENDER == "M", "Male", "Female"),
+         sex = factor(sex, levels = c("Male", "Female")),
+         race = case_when(
+           CAN_RACE == 8 ~ "White",
+           CAN_RACE == 16 ~ "Black",
+           CAN_RACE == 2000 ~ "Hispanic/Latino",
+           CAN_RACE == 64 ~ "Asian",
+           TRUE ~ "Other"), 
+         race = factor(race, levels = c("White", "Black", "Hispanic/Latino", "Asian", "Other")),
+         functional_status = case_when(
+           CAN_FUNCTN_STAT > 2079 ~ "Good",
+           CAN_FUNCTN_STAT > 2049 & CAN_FUNCTN_STAT < 2071 ~ "Moderate",
+           CAN_FUNCTN_STAT > 2000 & CAN_FUNCTN_STAT < 2041 ~ "Poor",
+           TRUE ~ "Unknown"),
+         functional_status = ifelse(is.na(functional_status), "Unknown", functional_status),
+         functional_status = factor(functional_status, levels = c("Good", "Moderate", "Poor", "Unknown")),
+         blood_type = factor(
+           case_when(
+             CAN_ABO %in% c("A", "A1", "A2") ~ "A",
+             CAN_ABO %in% c("A1B", "A2B") ~ "AB",
+             TRUE ~ CAN_ABO)),
+         payor = case_when(
+           CAN_PRIMARY_PAY %in% c(2,3,4,5,6,7,13) ~ "Public",
+           CAN_PRIMARY_PAY == 1 ~ "Private",
+           TRUE ~ "Other"),
+         payor = factor(payor, levels = c("Private",
+                                          "Public",
+                                          "Other")),
+         diagnosis = case_when(
+           CAN_DGN == 4104 | CAN_DGN == 4106 | CAN_DGN == 4204 | CAN_DGN == 4206 ~ "Hepatitis C",
+           CAN_DGN == 4102 | CAN_DGN == 4107 | CAN_DGN == 4202 | CAN_DGN == 4207 ~ "Hepatitis B",
+           CAN_DGN >= 4215 & CAN_DGN <= 4219 ~ "Alcohol-Associated Liver Disease",
+           CAN_DGN == 4220 ~ "Primary Biliary Cirrhosis",
+           CAN_DGN >= 4240 & CAN_DGN <= 4245 ~ "Primary Sclerosing Cholangitis",
+           CAN_DGN == 4214 ~ "Metabolic Dysfunction-Associated Steatotic Liver Disease",
+           CAN_DGN == 4212 ~ "Autoimmune Hepatitis",
+           CAN_DGN == 4208 | CAN_DGN == 4209 | CAN_DGN == 4210 | CAN_DGN == 4213 ~ "Idiopathic Cirrhosis",
+           TRUE ~ "Other"),
+         diagnosis = factor(diagnosis, levels = c("Alcohol-Associated Liver Disease", "Metabolic Dysfunction-Associated Steatotic Liver Disease", 
+                                                  "Hepatitis C", "Hepatitis B", "Primary Biliary Cirrhosis", "Primary Sclerosing Cholangitis",
+                                                  "Autoimmune Hepatitis", "Idiopathic Cirrhosis", "Other")),
+         condition = case_when(
+           CAN_MED_COND == 1 ~ "Hospitalized, in ICU at Listing",
+           CAN_MED_COND == 2 ~ "Hospitalized, not in ICU at Listing",
+           CAN_MED_COND == 3 ~ "Not Hospitalized at Listing",
+           TRUE ~ "Unknown"),
+         condition = factor(condition, levels = c("Hospitalized, in ICU at Listing", "Hospitalized, not in ICU at Listing", "Not Hospitalized at Listing", "Unknown")),
+         exception_type = case_when(
+           REC_EXCEPTION == 1 ~ "Received Non-Standardized Exception",
+           TRUE ~ "No Exception"),
+         exception_type = factor(exception_type, levels = c("Received Non-Standardized Exception",
+                                                            "No Exception")))
+
+
+var_label_list <- list(age = "Age at Listing (Years)",
+                       agegroup = "Age Group",
+                       sex = "Sex",
+                       race = "Race",
+                       blood_type = "Blood Type",
+                       functional_status = "Functional Status",
+                       condition = "Condition at Listing",
+                       payor = "Insurance Type",
+                       diagnosis = "Primary Diagnosis",
+                       exception_type = "Exception Status")
+labelled::var_label(fortable1) <- var_label_list
+
+
+fortable1 %>%
+  dplyr::select(
+    age, agegroup, sex, race, blood_type, functional_status, payor, diagnosis, exception_type
+  ) %>%
+  tbl_summary(by = exception_type) %>%
+  add_p(test.args = all_tests("chisq.test") ~ list(workspace=2e7)) %>%
+  add_overall() %>%
+  as_gt() 
+
+
+```
+

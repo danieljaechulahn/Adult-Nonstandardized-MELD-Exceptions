@@ -1,0 +1,163 @@
+---
+title: "Fig 5 Map Code"
+author: "Daniel Ahn"
+date: "2024-03-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r library}
+
+library(tidyverse)
+library(haven)
+library(geodist)
+library(purrr)
+library(ggmap)
+library(tidycensus)
+library(tigris)
+library(sf)
+library(usa)
+library(ggspatial)
+library(beepr)
+library(censusxy)
+library(tidygeocoder)
+library(geosphere)
+library(ggalt)
+library(ggsci)
+library(ggthemes)
+library(ggrepel)
+library(ggpubr)
+library(RColorBrewer)
+library(kableExtra)
+library(weights)
+library(gridExtra)
+library(ggpubr)
+library(grid)
+
+```
+
+
+```{r Map}
+# centers with geocodes
+center_long_lat <- center_geocodes %>%
+  rename(long = lon, CTR_NAME = ENTIRE_NAME) %>%
+  mutate(CAN_LISTING_CTR_ID = CTR_ID)
+
+# clean up NA and incorrectly coded regions
+# https://optn.transplant.hrsa.gov/about/search-membership/?memberType=Transplant+Centers&organType=Liver&state=-1&region=0
+
+regionstatekey <- regionstatekey %>%
+  dplyr::select(1,2)
+regionstatekey$PRIMARY_STATE <- state.abb[match(regionstatekey$State,state.name)]
+
+df <- finaldataset %>%
+  left_join(center_long_lat) %>%
+  # clean up regions
+  left_join(regionkey) %>%
+  mutate(POLICY_COHORT = factor(POLICY_COHORT, levels = c("Pre-Policy", "Between", "Post-Policy")))
+
+opo_id_to_name <- institutionq3 %>%
+  filter(CTR_TY %in% c("FOP", "IO1", "OP1")) %>%
+  dplyr::select(CTR_CD, CTR_ID) %>%
+  rename(OPO = CTR_ID)
+
+df_by_ctr <- df %>%
+  group_by(REGION, CTR_ID, POLICY_COHORT) %>%
+  summarise(total_cand = n(), exceptions = sum(REC_EXCEPTION), na.rm = TRUE) %>%
+  left_join(center_long_lat %>% dplyr::select(-CAN_LISTING_CTR_ID))
+
+# get state shapefiles
+
+# states <- get_acs(geography = "state", variable = "B01001_001", year = 2019, geometry = TRUE)
+# #
+# save(file = "states.R", states)
+# 
+
+
+states <- states %>%
+  dplyr::select(-variable, -estimate, -moe, -GEOID) %>%
+  rename(PRIMARY_STATE = NAME)
+
+states$PRIMARY_STATE = state.abb[match(states$PRIMARY_STATE,state.name)]
+
+states <- states %>%
+  filter(PRIMARY_STATE != "AK" & PRIMARY_STATE != "HI" & PRIMARY_STATE != "PR")
+
+
+# create expanded dataset for graphing
+expand <- states %>% 
+  left_join(df) %>%
+  expand(PRIMARY_STATE, POLICY_COHORT) %>%
+  filter(is.na(POLICY_COHORT) == FALSE) %>%
+  # Vermont is split between regions 1 and 9, randomly assigned to 1 because it doesn't show up in the actual dataset
+  left_join(regionstatekey) %>%
+  mutate(Region = case_when(PRIMARY_STATE == "VT" ~ 1,
+                            TRUE ~ Region)) %>%
+  dplyr::select(-State)
+
+df_by_region <- df %>% 
+  group_by(Region, PRIMARY_STATE, POLICY_COHORT) %>%
+  summarise(total_cand = n(), exceptions = sum(REC_EXCEPTION), na.rm = TRUE) %>%
+  right_join(expand) %>%
+  # replace NAs with 0s so missing states are colored with region rather than showing up gray in map
+  tidyr::replace_na(list(exceptions = 0, total_cand = 0)) %>%
+  group_by(Region, POLICY_COHORT) %>%
+  mutate(region_exceptions = sum(exceptions), region_cand = sum(total_cand), na.rm = TRUE) %>%
+  mutate(region_proportion = region_exceptions/region_cand)
+
+prepolicy <- df_by_region %>% ungroup() %>% group_by(Region) %>% filter(row_number() == 1) %>%
+  mutate(region_nonexception = region_cand - region_exceptions) %>% 
+  mutate(frequency = region_exceptions / region_cand) %>% ungroup() %>%
+  dplyr::select(c("region_exceptions", "region_nonexception", "frequency"))
+
+chisq.test(prepolicy)
+
+postpolicy <- df_by_region %>% ungroup() %>% group_by(Region) %>% slice(n()) %>%
+  mutate(region_nonexception = region_cand - region_exceptions) %>% 
+  mutate(frequency = region_exceptions / region_cand) %>% ungroup() %>%
+  dplyr::select(c("region_exceptions", "region_nonexception", "frequency"))
+
+chisq.test(postpolicy)
+
+policyexception <- df_by_region %>% ungroup() %>% filter(POLICY_COHORT != "Between") %>% 
+  group_by(POLICY_COHORT) %>% mutate(candtotal = sum(total_cand), exceptiontotal = sum(exceptions)) %>% 
+  slice(n()) %>% mutate(nonexceptiontotal = candtotal - exceptiontotal, prop = exceptiontotal/candtotal) %>% 
+  ungroup() %>%
+  dplyr::select(c("exceptiontotal", "nonexceptiontotal"))
+
+chisq.test(policyexception)
+
+df_to_graph <- states %>%
+  left_join(df_by_region)
+
+
+regionmapproportion <- ggplot(df_to_graph %>% filter(POLICY_COHORT != "Between")) +
+  geom_sf(aes(fill = region_proportion), color = NA) +
+  geom_sf(fill = "transparent", color = "white", size = 2,
+          data = . %>% group_by(Region) %>% summarise()) +
+  facet_wrap(vars(POLICY_COHORT), nrow = 3) +
+  scale_fill_viridis_c(limits = c(0, 0.35)) +
+  theme_void() +
+  theme(strip.text = element_text(size = 14)) +
+  labs(fill = "Proportion of Candidates with \nNon-Standardized Exceptions") +
+  theme(title = element_text(size = 12))
+  
+regionmapproportion
+
+barproportion <- df_by_region %>%
+  distinct(Region, POLICY_COHORT, region_proportion) %>%
+  filter(POLICY_COHORT != "Between") %>%
+  mutate(Region = factor(Region, levels = c(1:11))) %>%
+  ggplot() +
+  geom_col(aes(x = Region, y = region_proportion, fill = POLICY_COHORT), position = position_dodge(width = 0.67), alpha = 0.9) +
+  labs(fill = "Cohort", y = "Proportion of Candidates with Exception",
+       title = "")
+
+barproportion
+
+```
+
