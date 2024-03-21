@@ -1,0 +1,543 @@
+---
+title: "Paper Figures"
+author: "Daniel Ahn"
+date: "2024-03-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r fig2}
+
+exceptions <- timeseriesdata %>% group_by(PX_ID) %>% arrange(PX_ID, CANHX_BEGIN_DT) %>% filter(REC_EXCEPTION == 1) %>% 
+  filter(EXCEPTION == 1) %>% mutate(type = 0) %>% dplyr::select(c("PX_ID", "ALLOCATION_SCORE", "LAB_SCORE", "type", "POLICY_COHORT", "TIME1", "TIME2")) %>%
+  mutate(TIMELAPSED = TIME2 - TIME1)
+exceptions$TOTALTIME <- ave(exceptions$TIMELAPSED, exceptions$PX_ID, FUN=sum)
+exceptions <- exceptions %>% mutate(WEIGHT_ALLOCATE = ALLOCATION_SCORE * (TIMELAPSED / TOTALTIME),
+                                    WEIGHT_LABORATORY = LAB_SCORE * (TIMELAPSED / TOTALTIME))
+exceptions$AVG_ALLOCATION_SCORE <- ave(exceptions$WEIGHT_ALLOCATE, exceptions$PX_ID, FUN=sum)
+exceptions$AVG_LAB_SCORE <- ave(exceptions$WEIGHT_LABORATORY, exceptions$PX_ID, FUN=sum)
+exceptions <- exceptions %>% mutate(AVG_SCORE_DIFFERENCE = AVG_ALLOCATION_SCORE - AVG_LAB_SCORE)
+exceptions <- exceptions %>% mutate(count = n()) %>% filter(row_number() == 1)
+
+exceptions1 <- timeseriesdata %>% group_by(PX_ID) %>% arrange(PX_ID, CANHX_BEGIN_DT) %>% filter(REC_EXCEPTION == 1) %>% 
+  filter(EXCEPTION == 1) %>% mutate(type = 1) %>% dplyr::select(c("PX_ID", "ALLOCATION_SCORE", "LAB_SCORE", "type", "POLICY_COHORT", "TIME1", "TIME2")) %>%
+  mutate(TIMELAPSED = TIME2 - TIME1)
+exceptions1$TOTALTIME <- ave(exceptions1$TIMELAPSED, exceptions1$PX_ID, FUN=sum)
+exceptions1 <- exceptions1 %>% mutate(WEIGHT_ALLOCATE = ALLOCATION_SCORE * (TIMELAPSED / TOTALTIME),
+                                    WEIGHT_LABORATORY = LAB_SCORE * (TIMELAPSED / TOTALTIME))
+exceptions1$AVG_ALLOCATION_SCORE <- ave(exceptions1$WEIGHT_ALLOCATE, exceptions1$PX_ID, FUN=sum)
+exceptions1$AVG_LAB_SCORE <- ave(exceptions1$WEIGHT_LABORATORY, exceptions1$PX_ID, FUN=sum)
+exceptions1 <- exceptions1 %>% mutate(count = n()) %>% filter(row_number() == 1)
+
+
+exceptionspolicy <- exceptions %>% filter(POLICY_COHORT != "Between")
+t.test(AVG_ALLOCATION_SCORE ~ POLICY_COHORT, data = exceptionspolicy)
+t.test(AVG_LAB_SCORE ~ POLICY_COHORT, data = exceptionspolicy)
+t.test(AVG_SCORE_DIFFERENCE ~ POLICY_COHORT, data = exceptionspolicy)
+
+#Code for identifying median number of observations with exceptions
+median(exceptions$count)
+
+#Identifying median number of observations per patient
+median(finaldataset$Count)
+
+fig2 <- rbind(exceptions, exceptions1) %>% mutate(
+  newscore = case_when(
+    type == 0 ~ AVG_ALLOCATION_SCORE,
+    type == 1 ~ AVG_LAB_SCORE),
+  EXCEPT_TYPE = case_when(
+    type == 0 ~ "Candidate-Level Weighted Average Allocation MELD Score",
+    type == 1 ~ "Candidate-Level Weighted Average Laboratory MELD Score"
+  ))
+fig2$EXCEPT_TYPE <- as.factor(fig2$EXCEPT_TYPE)
+
+fig2 <- ggplot(data = fig2, aes(x = newscore)) +
+  geom_histogram(aes(fill = EXCEPT_TYPE), color = "black",
+                 position = "identity", bins = 35) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 18),
+        axis.text.y = element_text(size = 18),
+        axis.title.x = element_text(size = 20),
+        axis.title.y = element_text(size = 20),
+        legend.text = element_text(size = 18),
+        legend.position = "top",
+        plot.title = element_text(size = 14)) +
+  scale_fill_discrete(name = "") +
+  labs(x = "MELD Score", y = "Number of Candidates") + 
+  scale_x_continuous(breaks = c(0, 5, 10, 15, 20, 25, 30, 35, 40)) +
+  scale_alpha_manual(values = c(1, 0.3), guide = "none") +
+  guides(fill = guide_legend(nrow = 2))
+
+fig2
+
+
+```
+
+
+``` {r fig3}
+
+#This same code is in the RMD listed as "Mixed Effects Cox Models"
+model1 <- coxme(Surv(TIME1, TIME2, NEW_DEATH) ~ ALLOCATION_SCORE + SCORE_DIFFERENCE + (1 | CAN_LISTING_CTR_ID), data = timeseriesdata)
+
+model2 <- coxme(Surv(TIME1, TIME2, TX) ~  LAB_SCORE + SCORE_DIFFERENCE + (1 | CAN_LISTING_CTR_ID), data = timeseriesdata)
+
+plot1 <- plot_model(
+  model1,
+  show.values = TRUE,
+  value.offset = .3,
+  value.size = 6,
+  ci.lvl = 95,
+  p.shape = TRUE,
+  wrap.title = 75,
+  wrap.labels = 30,
+  axis.labels = c(
+    "Allocation and Laboratory MELD Score Difference",
+    "Allocation MELD Score"
+    
+  ),
+  title = "Association of Exceptions with Pre-Transplant Mortality",
+  axis.title = "Cause-Specific Hazard Ratio",
+  grid.breaks = c(0.1, 1, 10)
+)
+plot1.0 <- plot1 + theme_sjplot() +
+  theme(text = element_text(size = 20),
+        axis.text = element_text(colour = "black"))
+
+plot1.0
+
+plot2 <- plot_model(
+  model2,
+  show.values = TRUE,
+  show.p = TRUE,
+  value.offset = .3,
+  value.size = 6,
+  wrap.title = 75,
+  wrap.labels = 30,
+  axis.labels = c(
+    "Allocation and Laboratory MELD Score Difference",
+    "Laboratory MELD Score"
+  ),
+  title = "Association of Exceptions with DDLT",
+  axis.title = "Cause-Specific Hazard Ratio",
+  grid.breaks = c(0.1, 1, 10)
+)
+plot2.0 <- plot2 + theme_sjplot() +
+  theme(text = element_text(size = 20),
+        axis.text = element_text(colour = "black"))
+
+plot_grid(plot1.0, plot2.0,
+          ncol = 2, nrow = 1,
+          labels = c("A", "B"))
+
+
+```
+
+
+``` {r fig4}
+
+require(rms)
+finalmodel <- timeseriesdata %>% dplyr::select(c("PX_ID", "LAB_SCORE", "ALLOCATION_SCORE", 
+                                                 "SCORE_DIFFERENCE", "NEW_DEATH", "TIME1", "TIME2", "TX"))
+dd <- datadist(finalmodel)
+options(datadist = "dd")
+fit <- cph(Surv(TIME1, TIME2, NEW_DEATH) ~ ALLOCATION_SCORE + SCORE_DIFFERENCE, data = finalmodel)
+
+s1.1 <-Predict(fit, ALLOCATION_SCORE, SCORE_DIFFERENCE = 0, fun = exp)
+s1.2 <-Predict(fit, ALLOCATION_SCORE, SCORE_DIFFERENCE = 5, fun = exp)
+s1.3 <-Predict(fit, ALLOCATION_SCORE, SCORE_DIFFERENCE = 10, fun = exp)
+s1.4 <-Predict(fit, ALLOCATION_SCORE, SCORE_DIFFERENCE = 15, fun = exp)
+s1.5 <-Predict(fit, ALLOCATION_SCORE, SCORE_DIFFERENCE = 20, fun = exp)
+
+s1 <- rbind("Exception Points = 0" = s1.1, "Exception Points = 5" = s1.2, "Exception Points = 10" = s1.3,
+            "Exception Points = 15" = s1.4, "Exception Points = 20" = s1.5)
+
+hazardplot1 <- ggplot(s1) + geom_line(lwd = 2) + theme_classic() + 
+  scale_x_continuous(breaks = c(0, 5, 10, 15, 20, 25, 30, 35, 40)) +
+  theme(legend.title=element_blank(),
+        axis.text.x = element_text(size = 18),
+        axis.text.y = element_text(size = 18),
+        axis.title.x = element_text(size = 20),
+        axis.title.y = element_text(size = 20),
+        legend.text = element_text(size = 18)) +
+  geom_vline(aes(xintercept = mean(finalmodel$ALLOCATION_SCORE), linetype = "Mean Allocation MELD Score")) +
+  theme(legend.title=element_blank()) +
+  labs(
+    y = "Hazard of Pre-Transplant Mortality",
+    x = "Allocation MELD Score",
+    linetype = "") +
+  scale_linetype_manual(values = c("dashed", "dotted", "solid")) 
+
+hazardplot1
+
+fit1 <- cph(Surv(TIME1, TIME2, TX) ~ LAB_SCORE + SCORE_DIFFERENCE, data = finalmodel)
+
+s2.1 <-Predict(fit1, LAB_SCORE, SCORE_DIFFERENCE = 0, fun = exp)
+s2.2 <-Predict(fit1, LAB_SCORE, SCORE_DIFFERENCE = 5, fun = exp)
+s2.3 <-Predict(fit1, LAB_SCORE, SCORE_DIFFERENCE = 10, fun = exp)
+s2.4 <-Predict(fit1, LAB_SCORE, SCORE_DIFFERENCE = 15, fun = exp)
+s2.5 <-Predict(fit1, LAB_SCORE, SCORE_DIFFERENCE = 20, fun = exp)
+
+s2 <- rbind("Exception Points = 0" = s2.1, "Exception Points = 5" = s2.2, "Exception Points = 10" = s2.3,
+            "Exception Points = 15" = s2.4, "Exception Points = 20" = s2.5)
+
+hazardplot2 <- ggplot(s2) + geom_line(lwd = 2) + theme_classic() + 
+  scale_x_continuous(breaks = c(0, 5, 10, 15, 20, 25, 30, 35, 40)) + 
+  theme(legend.title=element_blank(),
+        axis.text.x = element_text(size = 18),
+        axis.text.y = element_text(size = 18),
+        axis.title.x = element_text(size = 20),
+        axis.title.y = element_text(size = 20),
+        legend.text = element_text(size = 18)) +
+  geom_vline(aes(xintercept = mean(finalmodel$LAB_SCORE), linetype = "Mean Laboratory MELD Score")) +
+  labs(
+    y = "Hazard of Receiving Deceased \nDonor Liver Transplant",
+    x = "Laboratory MELD Score",
+    linetype = "") +
+  scale_linetype_manual(values = c("dotted", "dashed", "solid"))
+
+hazardplot2
+
+plot_grid(hazardplot1, hazardplot2,
+          ncol = 2, nrow = 1, labels = c("A", "B"))
+
+
+```
+
+
+``` {r fig6}
+
+timeseriesdata$CANHX_END_DT[is.na(timeseriesdata$CANHX_END_DT)] <- timeseriesdata$CAN_LAST_ACT_STAT_DT[is.na(timeseriesdata$CANHX_END_DT)]
+timeseriesdata$CANHX_BEGIN_DT <- ymd(timeseriesdata$CANHX_BEGIN_DT)
+timeseriesdata$CANHX_END_DT <- ymd(timeseriesdata$CANHX_END_DT)
+exceptionsduringlisting <- timeseriesdata %>% group_by(PX_ID) %>% arrange(CANHX_BEGIN_DT) %>%
+  period_to_months(CANHX_BEGIN_DT, CANHX_END_DT) 
+
+#This code is to divide waitlist period into months so that the monthly percentage of listed candidates with non-standardized exceptions can be plotted
+
+exceptionsduringlisting <- exceptionsduringlisting %>% mutate(monthoflisting = case_when(
+    CANHX_BEGIN_DT >= as.POSIXct("2016-02-01") & CANHX_BEGIN_DT < as.POSIXct("2016-03-01") ~ "02 2016",
+    CANHX_BEGIN_DT >= as.POSIXct("2016-03-01") & CANHX_BEGIN_DT < as.POSIXct("2016-04-01") ~ "03 2016",
+    CANHX_BEGIN_DT >= as.POSIXct("2016-04-01") & CANHX_BEGIN_DT < as.POSIXct("2016-05-01") ~ "04 2016",
+    CANHX_BEGIN_DT >= as.POSIXct("2016-05-01") & CANHX_BEGIN_DT < as.POSIXct("2016-06-01") ~ "05 2016",
+    CANHX_BEGIN_DT >= as.POSIXct("2016-06-01") & CANHX_BEGIN_DT < as.POSIXct("2016-07-01") ~ "06 2016",
+    CANHX_BEGIN_DT >= as.POSIXct("2016-07-01") & CANHX_BEGIN_DT < as.POSIXct("2016-08-01") ~ "07 2016",
+    CANHX_BEGIN_DT >= as.POSIXct("2016-08-01") & CANHX_BEGIN_DT < as.POSIXct("2016-09-01") ~ "08 2016",
+    CANHX_BEGIN_DT >= as.POSIXct("2016-09-01") & CANHX_BEGIN_DT < as.POSIXct("2016-10-01") ~ "09 2016",
+    CANHX_BEGIN_DT >= as.POSIXct("2016-10-01") & CANHX_BEGIN_DT < as.POSIXct("2016-11-01") ~ "10 2016",
+    CANHX_BEGIN_DT >= as.POSIXct("2016-11-01") & CANHX_BEGIN_DT < as.POSIXct("2016-12-01") ~ "11 2016",
+    CANHX_BEGIN_DT >= as.POSIXct("2016-12-01") & CANHX_BEGIN_DT < as.POSIXct("2017-01-01") ~ "12 2016",
+    CANHX_BEGIN_DT >= as.POSIXct("2017-01-01") & CANHX_BEGIN_DT < as.POSIXct("2017-02-01") ~ "01 2017",
+    CANHX_BEGIN_DT >= as.POSIXct("2017-02-01") & CANHX_BEGIN_DT < as.POSIXct("2017-03-01") ~ "02 2017",
+    CANHX_BEGIN_DT >= as.POSIXct("2017-03-01") & CANHX_BEGIN_DT < as.POSIXct("2017-04-01") ~ "03 2017",
+    CANHX_BEGIN_DT >= as.POSIXct("2017-04-01") & CANHX_BEGIN_DT < as.POSIXct("2017-05-01") ~ "04 2017",
+    CANHX_BEGIN_DT >= as.POSIXct("2017-05-01") & CANHX_BEGIN_DT < as.POSIXct("2017-06-01") ~ "05 2017",
+    CANHX_BEGIN_DT >= as.POSIXct("2017-06-01") & CANHX_BEGIN_DT < as.POSIXct("2017-07-01") ~ "06 2017",
+    CANHX_BEGIN_DT >= as.POSIXct("2017-07-01") & CANHX_BEGIN_DT < as.POSIXct("2017-08-01") ~ "07 2017",
+    CANHX_BEGIN_DT >= as.POSIXct("2017-08-01") & CANHX_BEGIN_DT < as.POSIXct("2017-09-01") ~ "08 2017",
+    CANHX_BEGIN_DT >= as.POSIXct("2017-09-01") & CANHX_BEGIN_DT < as.POSIXct("2017-10-01") ~ "09 2017",
+    CANHX_BEGIN_DT >= as.POSIXct("2017-10-01") & CANHX_BEGIN_DT < as.POSIXct("2017-11-01") ~ "10 2017",
+    CANHX_BEGIN_DT >= as.POSIXct("2017-11-01") & CANHX_BEGIN_DT < as.POSIXct("2017-12-01") ~ "11 2017",
+    CANHX_BEGIN_DT >= as.POSIXct("2017-12-01") & CANHX_BEGIN_DT < as.POSIXct("2018-01-01") ~ "12 2017",
+    CANHX_BEGIN_DT >= as.POSIXct("2018-01-01") & CANHX_BEGIN_DT < as.POSIXct("2018-02-01") ~ "01 2018",
+    CANHX_BEGIN_DT >= as.POSIXct("2018-02-01") & CANHX_BEGIN_DT < as.POSIXct("2018-03-01") ~ "02 2018",
+    CANHX_BEGIN_DT >= as.POSIXct("2018-03-01") & CANHX_BEGIN_DT < as.POSIXct("2018-04-01") ~ "03 2018",
+    CANHX_BEGIN_DT >= as.POSIXct("2018-04-01") & CANHX_BEGIN_DT < as.POSIXct("2018-05-01") ~ "04 2018",
+    CANHX_BEGIN_DT >= as.POSIXct("2018-05-01") & CANHX_BEGIN_DT < as.POSIXct("2018-06-01") ~ "05 2018",
+    CANHX_BEGIN_DT >= as.POSIXct("2018-06-01") & CANHX_BEGIN_DT < as.POSIXct("2018-07-01") ~ "06 2018",
+    CANHX_BEGIN_DT >= as.POSIXct("2018-07-01") & CANHX_BEGIN_DT < as.POSIXct("2018-08-01") ~ "07 2018",
+    CANHX_BEGIN_DT >= as.POSIXct("2018-08-01") & CANHX_BEGIN_DT < as.POSIXct("2018-09-01") ~ "08 2018",
+    CANHX_BEGIN_DT >= as.POSIXct("2018-09-01") & CANHX_BEGIN_DT < as.POSIXct("2018-10-01") ~ "09 2018",
+    CANHX_BEGIN_DT >= as.POSIXct("2018-10-01") & CANHX_BEGIN_DT < as.POSIXct("2018-11-01") ~ "10 2018",
+    CANHX_BEGIN_DT >= as.POSIXct("2018-11-01") & CANHX_BEGIN_DT < as.POSIXct("2018-12-01") ~ "11 2018",
+    CANHX_BEGIN_DT >= as.POSIXct("2018-12-01") & CANHX_BEGIN_DT < as.POSIXct("2019-01-01") ~ "12 2018",
+    CANHX_BEGIN_DT >= as.POSIXct("2019-01-01") & CANHX_BEGIN_DT < as.POSIXct("2019-02-01") ~ "01 2019",
+    CANHX_BEGIN_DT >= as.POSIXct("2019-02-01") & CANHX_BEGIN_DT < as.POSIXct("2019-03-01") ~ "02 2019",
+    CANHX_BEGIN_DT >= as.POSIXct("2019-03-01") & CANHX_BEGIN_DT < as.POSIXct("2019-04-01") ~ "03 2019",
+    CANHX_BEGIN_DT >= as.POSIXct("2019-04-01") & CANHX_BEGIN_DT < as.POSIXct("2019-05-01") ~ "04 2019",
+    CANHX_BEGIN_DT >= as.POSIXct("2019-05-01") & CANHX_BEGIN_DT < as.POSIXct("2019-06-01") ~ "05 2019",
+    CANHX_BEGIN_DT >= as.POSIXct("2019-06-01") & CANHX_BEGIN_DT < as.POSIXct("2019-07-01") ~ "06 2019",
+    CANHX_BEGIN_DT >= as.POSIXct("2019-07-01") & CANHX_BEGIN_DT < as.POSIXct("2019-08-01") ~ "07 2019",
+    CANHX_BEGIN_DT >= as.POSIXct("2019-08-01") & CANHX_BEGIN_DT < as.POSIXct("2019-09-01") ~ "08 2019",
+    CANHX_BEGIN_DT >= as.POSIXct("2019-09-01") & CANHX_BEGIN_DT < as.POSIXct("2019-10-01") ~ "09 2019",
+    CANHX_BEGIN_DT >= as.POSIXct("2019-10-01") & CANHX_BEGIN_DT < as.POSIXct("2019-11-01") ~ "10 2019",
+    CANHX_BEGIN_DT >= as.POSIXct("2019-11-01") & CANHX_BEGIN_DT < as.POSIXct("2019-12-01") ~ "11 2019",
+    CANHX_BEGIN_DT >= as.POSIXct("2019-12-01") & CANHX_BEGIN_DT < as.POSIXct("2020-01-01") ~ "12 2019",
+    CANHX_BEGIN_DT >= as.POSIXct("2020-01-01") & CANHX_BEGIN_DT < as.POSIXct("2020-02-01") ~ "01 2020",
+    CANHX_BEGIN_DT >= as.POSIXct("2020-02-01") & CANHX_BEGIN_DT < as.POSIXct("2020-03-01") ~ "02 2020",
+    CANHX_BEGIN_DT >= as.POSIXct("2020-03-01") & CANHX_BEGIN_DT < as.POSIXct("2020-04-01") ~ "03 2020",
+    CANHX_BEGIN_DT >= as.POSIXct("2020-04-01") & CANHX_BEGIN_DT < as.POSIXct("2020-05-01") ~ "04 2020",
+    CANHX_BEGIN_DT >= as.POSIXct("2020-05-01") & CANHX_BEGIN_DT < as.POSIXct("2020-06-01") ~ "05 2020",
+    CANHX_BEGIN_DT >= as.POSIXct("2020-06-01") & CANHX_BEGIN_DT < as.POSIXct("2020-07-01") ~ "06 2020",
+    CANHX_BEGIN_DT >= as.POSIXct("2020-07-01") & CANHX_BEGIN_DT < as.POSIXct("2020-08-01") ~ "07 2020",
+    CANHX_BEGIN_DT >= as.POSIXct("2020-08-01") & CANHX_BEGIN_DT < as.POSIXct("2020-09-01") ~ "08 2020",
+    CANHX_BEGIN_DT >= as.POSIXct("2020-09-01") & CANHX_BEGIN_DT < as.POSIXct("2020-10-01") ~ "09 2020",
+    CANHX_BEGIN_DT >= as.POSIXct("2020-10-01") & CANHX_BEGIN_DT < as.POSIXct("2020-11-01") ~ "10 2020",
+    CANHX_BEGIN_DT >= as.POSIXct("2020-11-01") & CANHX_BEGIN_DT < as.POSIXct("2020-12-01") ~ "11 2020",
+    CANHX_BEGIN_DT >= as.POSIXct("2020-12-01") & CANHX_BEGIN_DT < as.POSIXct("2021-01-01") ~ "12 2020",
+    CANHX_BEGIN_DT >= as.POSIXct("2021-01-01") & CANHX_BEGIN_DT < as.POSIXct("2021-02-01") ~ "01 2021",
+    CANHX_BEGIN_DT >= as.POSIXct("2021-02-01") & CANHX_BEGIN_DT < as.POSIXct("2021-03-01") ~ "02 2021",
+    CANHX_BEGIN_DT >= as.POSIXct("2021-03-01") & CANHX_BEGIN_DT < as.POSIXct("2021-04-01") ~ "03 2021",
+    CANHX_BEGIN_DT >= as.POSIXct("2021-04-01") & CANHX_BEGIN_DT < as.POSIXct("2021-05-01") ~ "04 2021",
+    CANHX_BEGIN_DT >= as.POSIXct("2021-05-01") & CANHX_BEGIN_DT < as.POSIXct("2021-06-01") ~ "05 2021",
+    CANHX_BEGIN_DT >= as.POSIXct("2021-06-01") & CANHX_BEGIN_DT < as.POSIXct("2021-07-01") ~ "06 2021",
+    CANHX_BEGIN_DT >= as.POSIXct("2021-07-01") & CANHX_BEGIN_DT < as.POSIXct("2021-08-01") ~ "07 2021",
+    CANHX_BEGIN_DT >= as.POSIXct("2021-08-01") & CANHX_BEGIN_DT < as.POSIXct("2021-09-01") ~ "08 2021",
+    CANHX_BEGIN_DT >= as.POSIXct("2021-09-01") & CANHX_BEGIN_DT < as.POSIXct("2021-10-01") ~ "09 2021",
+    CANHX_BEGIN_DT >= as.POSIXct("2021-10-01") & CANHX_BEGIN_DT < as.POSIXct("2021-11-01") ~ "10 2021",
+    CANHX_BEGIN_DT >= as.POSIXct("2021-11-01") & CANHX_BEGIN_DT < as.POSIXct("2021-12-01") ~ "11 2021",
+    CANHX_BEGIN_DT >= as.POSIXct("2021-12-01") & CANHX_BEGIN_DT < as.POSIXct("2022-01-01") ~ "12 2021",
+    CANHX_BEGIN_DT >= as.POSIXct("2022-01-01") & CANHX_BEGIN_DT < as.POSIXct("2022-02-01") ~ "01 2022",
+    CANHX_BEGIN_DT >= as.POSIXct("2022-02-01") & CANHX_BEGIN_DT < as.POSIXct("2022-03-01") ~ "02 2022",
+    CANHX_BEGIN_DT >= as.POSIXct("2022-03-01") & CANHX_BEGIN_DT < as.POSIXct("2022-04-01") ~ "03 2022",
+    CANHX_BEGIN_DT >= as.POSIXct("2022-04-01") & CANHX_BEGIN_DT < as.POSIXct("2022-05-01") ~ "04 2022",
+    CANHX_BEGIN_DT >= as.POSIXct("2022-05-01") & CANHX_BEGIN_DT < as.POSIXct("2022-06-01") ~ "05 2022",
+    CANHX_BEGIN_DT >= as.POSIXct("2022-06-01") & CANHX_BEGIN_DT < as.POSIXct("2022-07-01") ~ "06 2022",
+    CANHX_BEGIN_DT >= as.POSIXct("2022-07-01") & CANHX_BEGIN_DT < as.POSIXct("2022-08-01") ~ "07 2022",
+    CANHX_BEGIN_DT >= as.POSIXct("2022-08-01") & CANHX_BEGIN_DT < as.POSIXct("2022-09-01") ~ "08 2022",
+    CANHX_BEGIN_DT >= as.POSIXct("2022-09-01") & CANHX_BEGIN_DT < as.POSIXct("2022-10-01") ~ "09 2022",
+    CANHX_BEGIN_DT >= as.POSIXct("2022-10-01") & CANHX_BEGIN_DT < as.POSIXct("2022-11-01") ~ "10 2022",
+    CANHX_BEGIN_DT >= as.POSIXct("2022-11-01") & CANHX_BEGIN_DT < as.POSIXct("2022-12-01") ~ "11 2022",
+    CANHX_BEGIN_DT >= as.POSIXct("2022-12-01") & CANHX_BEGIN_DT < as.POSIXct("2023-01-01") ~ "12 2022",
+    CANHX_BEGIN_DT >= as.POSIXct("2023-01-01") & CANHX_BEGIN_DT < as.POSIXct("2023-02-01") ~ "01 2023",
+    CANHX_BEGIN_DT >= as.POSIXct("2023-02-01") & CANHX_BEGIN_DT < as.POSIXct("2023-03-01") ~ "02 2023",
+    CANHX_BEGIN_DT >= as.POSIXct("2023-03-01") & CANHX_BEGIN_DT < as.POSIXct("2023-04-01") ~ "03 2023",
+    CANHX_BEGIN_DT >= as.POSIXct("2023-04-01") & CANHX_BEGIN_DT < as.POSIXct("2023-05-01") ~ "04 2023",
+    CANHX_BEGIN_DT >= as.POSIXct("2023-05-01") & CANHX_BEGIN_DT < as.POSIXct("2023-06-01") ~ "05 2023",
+    CANHX_BEGIN_DT >= as.POSIXct("2023-06-01") & CANHX_BEGIN_DT < as.POSIXct("2023-07-01") ~ "06 2023",
+    CANHX_BEGIN_DT >= as.POSIXct("2023-07-01") & CANHX_BEGIN_DT < as.POSIXct("2023-08-01") ~ "07 2023",
+    CANHX_BEGIN_DT >= as.POSIXct("2023-08-01") & CANHX_BEGIN_DT < as.POSIXct("2023-09-01") ~ "08 2023",
+    CANHX_BEGIN_DT >= as.POSIXct("2023-09-01") & CANHX_BEGIN_DT < as.POSIXct("2023-10-01") ~ "09 2023",
+    CANHX_BEGIN_DT >= as.POSIXct("2023-10-01") & CANHX_BEGIN_DT < as.POSIXct("2023-11-01") ~ "10 2023",
+    CANHX_BEGIN_DT >= as.POSIXct("2023-11-01") & CANHX_BEGIN_DT < as.POSIXct("2023-12-01") ~ "11 2023",
+    CANHX_BEGIN_DT >= as.POSIXct("2023-12-01") & CANHX_BEGIN_DT < as.POSIXct("2024-01-01") ~ "12 2023")) %>%
+  ungroup() %>% group_by(PX_ID, monthoflisting) %>% 
+  mutate(exceptionwithinmonth = case_when(
+    any(EXCEPTION == 1) ~ 1,
+    TRUE ~ 0))
+
+exceptionsduringlisting <- exceptionsduringlisting %>% filter(row_number() == 1) %>%
+  filter(CANHX_BEGIN_DT < as.POSIXct("2022-05-01"))
+
+calculationsfig5 <- exceptionsduringlisting %>% mutate(nlrb = case_when(
+  CANHX_BEGIN_DT >= as.POSIXct("2016-06-01") & CANHX_BEGIN_DT < as.POSIXct("2019-05-01") ~ "pre-policy",
+  CANHX_BEGIN_DT >= as.POSIXct("2019-06-01") & CANHX_BEGIN_DT < as.POSIXct("2022-05-01") ~ "post-policy",
+  TRUE ~ "between"
+)) %>% dplyr::select("PX_ID", "EXCEPTION", "CANHX_BEGIN_DT", "nlrb",
+                     "CANHX_END_DT", "monthoflisting", "exceptionwithinmonth") %>%
+  ungroup() %>% group_by(nlrb, monthoflisting) %>% summarise(monthlylistings = n(), monthlyexceptions = sum(exceptionwithinmonth), na.rm = TRUE) %>%
+  mutate(exceptionproportion = monthlyexceptions / monthlylistings)
+
+calculationsfig5_addended <- calculationsfig5 %>% filter(nlrb != "between")
+t.test(exceptionproportion ~ nlrb, data = calculationsfig5_addended)
+
+prep <- calculationsfig5 %>% filter(nlrb == "pre-policy")
+mean(prep$exceptionproportion)
+
+postp <- calculationsfig5 %>% filter(nlrb == "post-policy")
+mean(postp$exceptionproportion)
+
+t.test(exceptionproportion ~ nlrb, data = calculationsfig5_addended)
+
+summarise(total_cand = n(), exceptions = sum(REC_EXCEPTION), na.rm = TRUE)
+
+hadexception <- exceptionsduringlisting %>% filter(exceptionwithinmonth == 1) %>% 
+  mutate(EXCEPTION_STATUS = case_when(
+    exceptionwithinmonth == 1 ~ "Active Exception"))
+noexception <- exceptionsduringlisting %>% 
+  mutate(EXCEPTION_STATUS = case_when(
+    exceptionwithinmonth == 0 | exceptionwithinmonth == 1 ~ "Total"))
+hadexception <- data_frame(hadexception)
+noexception <- data_frame(noexception)
+f5data <- rbind(hadexception, noexception)
+finalset1 <- f5data %>%
+  mutate(month = zoo::as.yearmon(CANHX_BEGIN_DT),
+         status = factor(EXCEPTION_STATUS,
+                         levels = c("Total", "Active Exception")))
+
+
+by_month1 <- finalset1 %>%
+  group_by(month) %>%
+  count(status) %>%
+  mutate(total_per_month = sum(n)) %>%
+  ungroup() %>%
+  mutate(month1 = factor(month),
+         percentage_per_month = 100*n/total_per_month) 
+policy_switch <- which(levels(by_month1$month1) == "May 2019")
+pre_policy_start <- which(levels(by_month1$month1) == "Jun 2016")
+pre_policy_end <- which(levels(by_month1$month1) == "Apr 2019")
+post_policy_start <- which(levels(by_month1$month1) == "Jun 2020")
+post_policy_end <- which(levels(by_month1$month1) == "Apr 2022")
+
+fig5 <- ggplot(by_month1, aes(x = month1, 
+                              y = n, 
+                              color = status, 
+                              group = status)) +
+  geom_line() + 
+  geom_point() +
+  geom_vline(aes(xintercept = policy_switch, linetype = "Policy Switch")) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        axis.title.x = element_text(margin = margin(t = 15, r = 0, b = 0, l = 0), size = 20),
+        axis.text.y = element_text(size = 18),
+        axis.title.y = element_text(size = 20),
+        legend.position = "bottom",
+        legend.title = element_text(size = 20),
+        legend.text = element_text(size = 20),
+        legend.margin = margin(t=0, r=0, b=0, l=0, unit = "mm"),
+        legend.direction = "vertical",
+        legend.title.align = 0,
+        panel.background = element_rect(fill = "grey99"),
+        plot.background = element_rect(fill = "white"),
+        panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(linewidth = 0.5, linetype = "solid", colour = "black")
+  ) +
+  labs(
+    x = "Month of Listing",
+    y = "Number of Active\nListings per Month",
+    linetype = "",
+    color = "Exception Status"
+  ) +
+  scale_linetype_manual(values = c("dashed", "dotted", "solid")) +
+  scale_fill_custom(palette = "simple") +
+  guides(colour = guide_legend(nrow = 1)) +
+  annotate("text", x = which(levels(by_month1$month1) == "Oct 2017"), y = 9000, label= "Pre-Policy Cohort", size = 20/.pt) +
+  annotate("text", x = which(levels(by_month1$month1) == "Oct 2020"), y = 9000, label= "Post-Policy Cohort", size = 20/.pt) +
+  annotate("rect",
+           xmin = which(levels(by_month1$month1) == "Jun 2016"),           
+           xmax = which(levels(by_month1$month1) == "Apr 2019"),
+           ymin = 0, 
+           ymax = 10000,  
+           alpha = 0.15) +
+  annotate("rect",
+           xmin = which(levels(by_month1$month1) == "Jun 2019"),            
+           xmax = which(levels(by_month1$month1) == "Apr 2022"),            
+           ymin = 0, 
+           ymax = 10000, 
+           alpha = 0.15) 
+
+fig5
+
+finalset1 <- f5data %>%
+  mutate(month = zoo::as.yearmon(CANHX_BEGIN_DT),
+         status = factor(EXCEPTION_STATUS,
+                         levels = c("Total", "Active Exception")))
+
+by_month <- finalset1 %>%
+  group_by(month) %>%
+  count(status) %>%
+  mutate(total_per_month = sum(n)) %>%
+  ungroup() %>%
+  mutate(month1 = factor(month),
+         percentage_per_month = n*100/total_per_month) 
+policy_switch <- which(levels(by_month$month1) == "May 2019")
+pre_policy_start <- which(levels(by_month$month1) == "Jun 2016")
+pre_policy_end <- which(levels(by_month$month1) == "Apr 2019")
+post_policy_start <- which(levels(by_month$month1) == "Jun 2019")
+post_policy_end <- which(levels(by_month$month1) == "Apr 2022")
+
+fig6 <- ggplot(by_month, aes(x = month1, 
+                             y = percentage_per_month, 
+                             fill = status, 
+                             group = status)) +
+  geom_col(alpha = 0.75, color = "NA") +
+  geom_vline(aes(xintercept = policy_switch, linetype = "Policy Switch")) + 
+  labs(
+    x = "",
+    y = "% Listings with Active\nExceptions per Month",
+    linetype = "",
+    fill = "status") +
+  scale_color_custom(name = "Exception Status at Transplant", palette = "simple") +
+  theme(legend.position = "bottom") +
+  scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, by = 20)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        axis.title.x = element_text(margin = margin(t = 15, r = 0, b = 0, l = 0), size = 20),
+        axis.text.y = element_text(size = 18),
+        axis.title.y = element_text(size = 20),
+        legend.position = "none",
+        legend.title = element_text(size = 20),
+        legend.text = element_blank(),
+        legend.margin = margin(t=0, r=0, b=0, l=0, unit = "mm"),
+        legend.direction = "vertical",
+        legend.title.align = 0,
+        panel.background = element_rect(fill = "grey99"),
+        plot.background = element_rect(fill = "white"),
+        panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(size = 0.5, linetype = "solid", colour = "black")
+  ) +
+  scale_linetype_manual(values = c("dashed", "dotted", "solid")) +
+  scale_fill_custom(name = "Status",
+                    breaks = c("Active Exception at Time of Transplant"),
+                    palette = "reallysimple") +
+  guides(colour = guide_legend(nrow = 1)) +
+  annotate("text", x = which(levels(by_month$month1) == "Oct 2017"), y = 95, label= "Pre-Policy Cohort", size = 20/.pt) +
+  annotate("text", x = which(levels(by_month$month1) == "Oct 2020"), y = 95, label= "Post-Policy Cohort", size = 20/.pt) +
+  annotate("rect",
+           xmin = pre_policy_start,           
+           xmax = pre_policy_end,
+           ymin = 0, 
+           ymax = 100,  
+           alpha = 0.15) +
+  annotate("rect",
+           xmin = post_policy_start,            
+           xmax = post_policy_end,            
+           ymin = 0, 
+           ymax = 100, 
+           alpha = 0.15) 
+fig6
+
+plot_grid(fig6, fig5,
+          ncol = 1, nrow = 2,
+          labels = c("A", "B"))
+
+
+
+```
+
+
+
+``` {r fig7}
+
+justexceptions <- timeseriesdata %>% ungroup() %>% group_by(PX_ID) %>% arrange(CANHX_BEGIN_DT) %>% filter(any(EXCEPTION == 1))
+exceptionsmodel <- coxme(Surv(TIME1, TIME2, NEW_DEATH) ~ SCORE_DIFFERENCE + diagnosis + (1 | CAN_LISTING_CTR_ID), data = justexceptions)
+tab_model(exceptionsmodel)
+
+
+diagnosistable <- justexceptions %>% group_by(PX_ID) %>% arrange(CANHX_BEGIN_DT) %>% filter(row_number() == 1) %>% ungroup() %>%
+  mutate(removaltype = case_when(
+    REMOVALTYPE == 0 | REMOVALTYPE == 2 ~ 0,
+    REMOVALTYPE == 1 ~ 1)) %>% ungroup() %>%
+  group_by(diagnosis) %>% 
+  summarise(count = n()) %>%
+  mutate(Label = paste0(format(round(count / sum(count) * 100, 1), nsmall = 1), "%"))
+  
+my.labels <- c("HCC", "Cholangiocarcinoma", "Other Primary\nLiver Malignancy",
+               "Liver Metastases\nfrom Other Primary", "AALD", 
+               "MASLD",
+               "Hepatitis C", "Hepatitis B", "Polycystic Liver Disease", "Primary Sclerosing Cholangitis",
+               "Primary Biliary Cirrhosis", "Idiopathic Cirrhosis", "Autoimmune Hepatitis",
+               "Other Cholestatic\nLiver Disease", "Liver Transplant Complications", "Metabolic Disease",
+               "Vascular Malformations", "Other")
+
+ggplot(data = diagnosistable, aes(x = diagnosis)) +
+  geom_bar(stat = "identity", aes(y = count), width = 0.8, position = "dodge") +
+  geom_text(aes(y = count, label = Label),
+            vjust = -0.5,
+            size = 18/.pt) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 18),
+        axis.text.y = element_text(size = 18),
+        axis.title.x = element_text(size = 20),
+        axis.title.y = element_text(size = 20)) +
+  labs(x = "Primary Diagnosis", y = "Number of Candidates") +
+  scale_x_discrete(labels = my.labels)
+
+
+
+```

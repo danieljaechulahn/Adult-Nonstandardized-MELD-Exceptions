@@ -43,7 +43,8 @@ library(purrr)
 library(risksetROC)
 library(insurancerating)
 library(data.table)
-
+library(rsample)
+library(rms)
 
 ```
 
