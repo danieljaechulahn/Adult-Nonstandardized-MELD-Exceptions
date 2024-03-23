@@ -1,0 +1,99 @@
+---
+title: "Supplemental Material"
+author: "Daniel Ahn"
+date: "2024-03-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r figure S1}
+
+#This code uses the same code as Fig 2in the Paper Figures RMD
+
+pre.exceptions <- timeseriesdata %>% filter(POLICY_COHORT == "Pre-Policy") %>% group_by(PX_ID) %>% arrange(PX_ID, CANHX_BEGIN_DT) %>% filter(REC_EXCEPTION == 1) %>% 
+  filter(EXCEPTION == 1) %>% mutate(type = 0) %>% dplyr::select(c("PX_ID", "ALLOCATION_SCORE", "LAB_SCORE", "type", "POLICY_COHORT", "TIME1", "TIME2")) %>% mutate(TIMELAPSED = TIME2 - TIME1)
+pre.exceptions$TOTALTIME <- ave(pre.exceptions$TIMELAPSED, pre.exceptions$PX_ID, FUN=sum)
+pre.exceptions <- pre.exceptions %>% mutate(WEIGHT_ALLOCATE = ALLOCATION_SCORE * (TIMELAPSED / TOTALTIME),
+                                    WEIGHT_LABORATORY = LAB_SCORE * (TIMELAPSED / TOTALTIME))
+pre.exceptions$AVG_ALLOCATION_SCORE <- ave(pre.exceptions$WEIGHT_ALLOCATE, pre.exceptions$PX_ID, FUN=sum)
+pre.exceptions$AVG_LAB_SCORE <- ave(pre.exceptions$WEIGHT_LABORATORY, pre.exceptions$PX_ID, FUN=sum)
+pre.exceptions <- pre.exceptions %>% mutate(AVG_SCORE_DIFFERENCE = AVG_ALLOCATION_SCORE - AVG_LAB_SCORE)
+pre.exceptions <- pre.exceptions %>% mutate(count = n()) %>% filter(row_number() == 1)
+
+post.exceptions <- timeseriesdata %>% filter(POLICY_COHORT == "Post-Policy") %>% group_by(PX_ID) %>% arrange(PX_ID, CANHX_BEGIN_DT) %>% filter(REC_EXCEPTION == 1) %>% 
+  filter(EXCEPTION == 1) %>% mutate(type = 0) %>% dplyr::select(c("PX_ID", "ALLOCATION_SCORE", "LAB_SCORE", "type", "POLICY_COHORT", "TIME1", "TIME2")) %>% mutate(TIMELAPSED = TIME2 - TIME1)
+post.exceptions$TOTALTIME <- ave(post.exceptions$TIMELAPSED, post.exceptions$PX_ID, FUN=sum)
+post.exceptions <- post.exceptions %>% mutate(WEIGHT_ALLOCATE = ALLOCATION_SCORE * (TIMELAPSED / TOTALTIME),
+                                    WEIGHT_LABORATORY = LAB_SCORE * (TIMELAPSED / TOTALTIME))
+post.exceptions$AVG_ALLOCATION_SCORE <- ave(post.exceptions$WEIGHT_ALLOCATE, post.exceptions$PX_ID, FUN=sum)
+post.exceptions$AVG_LAB_SCORE <- ave(post.exceptions$WEIGHT_LABORATORY, post.exceptions$PX_ID, FUN=sum)
+post.exceptions <- post.exceptions %>% mutate(AVG_SCORE_DIFFERENCE = AVG_ALLOCATION_SCORE - AVG_LAB_SCORE)
+post.exceptions <- post.exceptions %>% mutate(count = n()) %>% filter(row_number() == 1)
+
+
+exceptionspolicy <- exceptions %>% filter(POLICY_COHORT != "Between")
+t.test(AVG_ALLOCATION_SCORE ~ POLICY_COHORT, data = exceptionspolicy)
+t.test(AVG_LAB_SCORE ~ POLICY_COHORT, data = exceptionspolicy)
+t.test(AVG_SCORE_DIFFERENCE ~ POLICY_COHORT, data = exceptionspolicy)
+
+
+
+fig2.1 <- ggplot(data = subset(fig2, POLICY_COHORT == "Pre-Policy"), aes(x = newscore)) +
+  geom_histogram(aes(fill = EXCEPT_TYPE), color = "black",
+                 position = "identity", bins = 35) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(size = 12),
+        legend.text = element_text(size = 12),
+        legend.position = "top",
+        plot.title = element_text(size = 14)) +
+  scale_fill_discrete(name = "") +
+  labs(x = "MELD Score", y = "Number of Candidates") + 
+  scale_x_continuous(breaks = c(0, 5, 10, 15, 20, 25, 30, 35, 40)) +
+  scale_alpha_manual(values = c(1, 0.3), guide = "none") +
+  guides(fill = guide_legend(nrow = 2)) +
+  ggtitle("Pre-Policy") +
+  guides(fill = guide_legend(nrow = 2))
+
+fig2.1
+
+fig2.2 <- ggplot(data = subset(fig2, POLICY_COHORT == "Post-Policy"), aes(x = newscore)) +
+  geom_histogram(aes(fill = EXCEPT_TYPE), color = "black",
+                 position = "identity", bins = 35) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12),
+        plot.title = element_text(size = 14)) +
+  ylim(0, 1500) +
+  scale_fill_discrete(name = "") +
+  labs(x = "MELD Score", y = "Number of Candidates") + 
+  scale_x_continuous(breaks = c(0, 5, 10, 15, 20, 25, 30, 35, 40)) +
+  scale_alpha_manual(values = c(1, 0.3), guide = "none") +
+  ggtitle("Post-Policy") +
+  guides(fill = FALSE)
+
+fig2.2
+
+plot_grid(fig2.1, fig2.2,
+          ncol = 1, nrow = 2,
+          labels = c("A", "B"))
+
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
