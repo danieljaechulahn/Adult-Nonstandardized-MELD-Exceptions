@@ -88,9 +88,116 @@ plot_grid(fig2.1, fig2.2,
 
 ```
 
-## Including Plots
+``` {r figure s2}
 
-You can also embed plots, for example:
+coxpostpolicy <- filter(timeseriesdata, POLICY_COHORT == "Post-Policy")
+coxprepolicy <- filter(timeseriesdata, POLICY_COHORT == "Pre-Policy")
+
+premodel1 <- coxme(Surv(TIME1, TIME2, NEW_DEATH) ~ ALLOCATION_SCORE + SCORE_DIFFERENCE + (1 | CAN_LISTING_CTR_ID), data = coxprepolicy)
+tab_model(premodel1)
+
+postmodel1 <- coxme(Surv(TIME1, TIME2, NEW_DEATH) ~ ALLOCATION_SCORE + SCORE_DIFFERENCE + (1 | CAN_LISTING_CTR_ID), data = coxpostpolicy)
+tab_model(postmodel1)
+
+plota <- plot_model(
+  premodel1,
+  show.values = TRUE,
+  value.offset = .3,
+  value.size = 6,
+  ci.lvl = 95,
+  p.shape = TRUE,
+  wrap.title = 75,
+  wrap.labels = 30,
+  axis.labels = c(
+    "Allocation and Laboratory MELD Score Difference",
+    "Allocation MELD Score"
+    
+  ),
+  title = "Association of Exceptions with\nPre-Transplant Mortality, Pre-Policy",
+  axis.title = "Cause-Specific Hazard Ratio",
+  grid.breaks = c(0.1, 1, 10)
+)
+plota.0 <- plota + theme_sjplot() +
+  theme(text = element_text(size = 20),
+        axis.text = element_text(colour = "black"))
+
+
+plotb <- plot_model(
+  postmodel1,
+  show.values = TRUE,
+  show.p = TRUE,
+  value.offset = .3,
+  value.size = 6,
+  wrap.title = 75,
+  wrap.labels = 30,
+  axis.labels = c(
+    "Allocation and Laboratory MELD Score Difference",
+    "Allocation MELD Score"
+  ),
+  title = "Association of Exceptions with\nPre-Transplant Mortality, Post-Policy",
+  axis.title = "Cause-Specific Hazard Ratio",
+  grid.breaks = c(0.1, 1, 10)
+)
+plotb.0 <- plotb + theme_sjplot() +
+  theme(text = element_text(size = 20),
+        axis.text = element_text(colour = "black"))
+
+plot_grid(plota.0, plotb.0,
+          ncol = 2, nrow = 1,
+          labels = c("A", "B"))
+
+
+
+```
+
+
+``` {r figure s3}
+
+forfigs3 <- justexceptions %>% group_by(PX_ID) %>% arrange(CANHX_BEGIN_DT) %>% 
+  filter(row_number() == 1) %>% ungroup() %>%
+  mutate(removaltype = case_when(
+    REMOVALTYPE == 0 | REMOVALTYPE == 2 ~ 0,
+    REMOVALTYPE == 1 ~ 1))
+
+survfit2(Surv(TIME_TO_REMOVAL, removaltype) ~ diagnosis, data = forfigs3) %>%
+  ggsurvfit() + 
+  coord_cartesian(xlim = c(0, 180)) +
+  scale_x_continuous(breaks = c(0, 45, 90, 135, 180)) +
+  scale_y_continuous(
+    limits = c(0.9, 1),
+    labels = scales::percent, 
+    expand = c(0.01, 0)
+  ) +
+  xlab("Days after Listing") +
+  theme_classic() +
+  labs(title = "Pre-Transplant Survival Stratified by Primary Diagnosis")
+
+survdiff(Surv(TIME_TO_REMOVAL, removaltype) ~ diagnosis, data = forfigs3)
+
+
+```
+
+``` {r figure s4}
+
+barproportion <- df_by_region %>%
+  distinct(Region, POLICY_COHORT, region_proportion) %>%
+  filter(POLICY_COHORT != "Between") %>%
+  mutate(Region = factor(Region, levels = c(1:11))) %>%
+  ggplot() +
+  geom_col(aes(x = Region, y = region_proportion, fill = POLICY_COHORT), position = position_dodge(width = 0.67), alpha = 0.9) +
+  labs(fill = "Cohort", y = "Proportion of Candidates with Exception",
+       title = "")
+
+barproportion
+
+```
+
+``` {r table s5}
+
+exceptionsmodel <- coxme(Surv(TIME1, TIME2, NEW_DEATH) ~ SCORE_DIFFERENCE + diagnosis + (1 | CAN_LISTING_CTR_ID), data = justexceptions)
+tab_model(exceptionsmodel)
+
+```
 
 ```{r pressure, echo=FALSE}
 plot(pressure)

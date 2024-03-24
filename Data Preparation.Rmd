@@ -45,7 +45,6 @@ library(insurancerating)
 library(data.table)
 library(rsample)
 library(rms)
-
 ```
 
 # Data Sources
