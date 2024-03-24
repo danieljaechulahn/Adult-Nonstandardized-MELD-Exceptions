@@ -148,14 +148,7 @@ regionmapproportion <- ggplot(df_to_graph %>% filter(POLICY_COHORT != "Between")
   
 regionmapproportion
 
-barproportion <- df_by_region %>%
-  distinct(Region, POLICY_COHORT, region_proportion) %>%
-  filter(POLICY_COHORT != "Between") %>%
-  mutate(Region = factor(Region, levels = c(1:11))) %>%
-  ggplot() +
-  geom_col(aes(x = Region, y = region_proportion, fill = POLICY_COHORT), position = position_dodge(width = 0.67), alpha = 0.9) +
-  labs(fill = "Cohort", y = "Proportion of Candidates with Exception",
-       title = "")
+
 
 barproportion
 
