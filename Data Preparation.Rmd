@@ -1,0 +1,1219 @@
+---
+title: "Data Preparation"
+author: "Daniel Ahn"
+date: "2024-03-21"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Here, we load in the necessary libraries in R.
+
+```{r library}
+library(tidyverse)
+library(survival)
+library(cmprsk)
+library(survminer)
+library(lubridate)
+library(MatchIt)
+library(Matching)
+library(rgenoud)
+library(optmatch)
+library(devtools)
+library(survAUC)
+library(Hmisc)
+library(riskRegression)
+library(pec)
+library(boot)
+library(compareC)
+library(coin)
+library(etm)
+library(table1)
+library(sjPlot)
+library(sjmisc)
+library(sjlabelled)
+library(cowplot)
+library(coxme)
+library(cobalt)
+library(transplantr)
+library(dplyr)
+library(purrr)
+library(risksetROC)
+library(insurancerating)
+library(data.table)
+library(rsample)
+library(rms)
+```
+
+# Data Sources
+
+We uploaded all the necessary files from the SRTR Standard Analysis Files (2023 Q3).
+
+```{r data_read_in}
+
+#information about candidates added to the liver waitlist. 
+cand_liinq3 <- read_sas("cand_liinq3.sas7bdat", NULL)
+
+#information about MELD exceptions that have been submitted
+mpexceptq3 <- read_sas("mpexceptq3.sas7bdat", NULL)
+
+#all status updates throughout a candidate's time spent on the liver transplant waitlist
+stathist_liinq3 <- read_sas("stathist_liinq3.sas7bdat", NULL)
+
+#information about all liver transplant recipients
+tx_liq3 <- read_sas("tx_liq3.sas7bdat", NULL)
+
+#all transplant centers
+institutionq3 <- read_sas("institutionq3.sas7bdat", NULL)
+
+```
+
+# Data Cleaning
+
+```{r data_cleaning}
+
+cand_list <- cand_liin2024q1 %>% filter(WL_ORG == "LI" & (CAN_LISTING_DT >= as.POSIXct("2002-02-27")))
+
+death_before_listing <- cand_list %>% 
+  filter(CAN_LISTING_DT > CAN_DEATH_DT |
+         CAN_LISTING_DT > PERS_OPTN_DEATH_DT |
+         CAN_LISTING_DT > PERS_SSA_DEATH_DT) %>% 
+  dplyr::select(PERS_ID, CAN_LISTING_DT, CAN_DEATH_DT, PERS_OPTN_DEATH_DT, PERS_SSA_DEATH_DT)
+
+cand_list <- cand_list %>% filter(PERS_ID %in% death_before_listing$PERS_ID == FALSE)
+
+#I made another variable called age-group to separate candidates based on age at listing.
+cand_list <- cand_list %>%
+  mutate(
+    AGE_GROUP = case_when(
+      CAN_AGE_AT_LISTING < 12 ~ 0,
+      (CAN_AGE_AT_LISTING >= 12 & CAN_AGE_AT_LISTING < 18) ~ 1,
+      CAN_AGE_AT_LISTING >= 18 ~ 2
+    )
+  )
+
+cand_list <- filter(cand_list, AGE_GROUP == 2)
+
+#this code sets time range for our cohort and excludes people listed as Status 1 initially or as inactivated.
+cand_list <- filter(cand_list, (CAN_LISTING_DT >= as.POSIXct("2016-06-01") & 
+                                CAN_LISTING_DT <= as.POSIXct("2022-04-30"))) 
+
+
+cand_list <- cand_list %>%
+               filter(CAN_INIT_ACT_STAT_CD != 6010 &
+                      CAN_INIT_ACT_STAT_CD != 6011 & 
+                      CAN_INIT_ACT_STAT_CD != 6012 & 
+                      CAN_INIT_ACT_STAT_CD != 6030 & 
+                      CAN_INIT_ACT_STAT_CD != 6040 &
+                      CAN_INIT_ACT_STAT_CD != 6999)
+
+tx_list <- tx_li2024q1 %>% filter(PX_ID %in% cand_list$PX_ID)
+
+tx_list <- tx_list %>% dplyr::select(
+  PX_ID,
+  REC_AGE_IN_MONTHS_AT_TX,
+  REC_TX_ORG_TY,
+  REC_TX_TY,
+  TX_ID,
+  -starts_with("DON")
+)
+
+cand_list <- cand_list %>% left_join(tx_list, by = "PX_ID")
+
+cand_list_with_exceptions <- merge(cand_list, mpexcept2024q1, by = "PX_ID", all.x = TRUE) %>%
+  group_by(PX_ID) %>% arrange(CAN_LISTING_DT) 
+
+#merge the above dataset with mpexcept, which contains information about all submitted MELD exception applications
+
+#Filters for all patients who had at least one exception application submitted. Orders observations by date of exception application submission. Creates new variable EXC that equals 1 when a patient has an accepted standardized MELD exception (CANHX_MPXCPT_DGN = 9 and/or 3 refers to non-standardized).
+x1 <- cand_list_with_exceptions %>% filter(any(!is.na(CANHX_MPXCPT_CASE_ID))) %>% arrange(CANHX_MPXCPT_BEGIN_DT) %>%
+  mutate(EXC = case_when(
+    ((CANHX_MPXCPT_DGN != 9 & CANHX_MPXCPT_DGN != 3) & (CANHX_MPXCPT_STAT == 5 | CANHX_MPXCPT_STAT == 10 | CANHX_MPXCPT_STAT == 14 | CANHX_MPXCPT_STAT == 16 | CANHX_MPXCPT_STAT == 18 | CANHX_MPXCPT_STAT == 30)) ~ 1,
+    TRUE ~ 0
+  )) %>% filter(any(EXC == 1)) 
+
+#identify first observation per patient in which standardized MELD exception is registered to start.
+i1 <- setDT(x1)[(CANHX_MPXCPT_DGN != 9 & CANHX_MPXCPT_DGN != 3), .(colindex = .I[1]), PX_ID]$colindex
+x1.0 <- x1[i1] %>% mutate(TIME_TO_SE = as.numeric(difftime(CANHX_MPXCPT_BEGIN_DT, CAN_LISTING_DT, units = "days")),
+                          TIME_SE_TO_REM = as.numeric(difftime(CAN_REM_DT, CANHX_MPXCPT_BEGIN_DT, units = "days"))) %>%
+  filter(TIME_TO_SE > 0) %>% filter(TIME_SE_TO_REM > 0)
+
+x1.0$CAN_REM_CD <- x1.0$CAN_REM_CD * 0
+x1.0 <- x1.0 %>% dplyr::select(-c("CAN_REM_DT"))
+x1.0 <- rename(x1.0, CAN_REM_DT = CANHX_MPXCPT_BEGIN_DT)
+x1.0 <- x1.0 %>% dplyr::select("PX_ID", "PERS_ID", "REC_TX_DT", "CAN_REM_DT", "CAN_REM_CD", "CAN_REM_COD", "CAN_LISTING_DT", "CAN_DEATH_DT", "PERS_OPTN_DEATH_DT", "PERS_SSA_DEATH_DT", "CAN_MED_COND", "CAN_INIT_ACT_STAT_DT", "CAN_AGE_AT_LISTING", "CAN_INIT_ACT_STAT_CD", "CAN_INIT_SRTR_LAB_MELD", "CAN_LAST_STAT", "CAN_LAST_ACT_STAT_DT", "CAN_LISTING_CTR_CD", "CAN_DGN", "CAN_DGN_OSTXT", "CAN_GENDER", "CAN_ABO", "CAN_RACE", "CAN_ETHNICITY_SRTR", "CAN_FUNCTN_STAT", "CAN_AGE_IN_MONTHS_AT_LISTING", "CAN_PRIMARY_PAY", "CAN_BMI")
+
+x1.1 <- cand_list_with_exceptions %>% filter(any(!is.na(CANHX_MPXCPT_CASE_ID))) %>% 
+  mutate(EXC = case_when(
+    ((CANHX_MPXCPT_DGN != 9 & CANHX_MPXCPT_DGN != 3) & (CANHX_MPXCPT_STAT == 5 | CANHX_MPXCPT_STAT == 10 | CANHX_MPXCPT_STAT == 14 | CANHX_MPXCPT_STAT == 16 | CANHX_MPXCPT_STAT == 18 | CANHX_MPXCPT_STAT == 30)) ~ 1,
+    TRUE ~ 0
+  )) %>% filter(!any(EXC == 1)) %>% filter(row_number() == 1) %>%
+  dplyr::select("PX_ID", "PERS_ID", "REC_TX_DT", "CAN_REM_DT", "CAN_REM_CD", 
+                "CAN_REM_COD", "CAN_LISTING_DT", "CAN_DEATH_DT",
+                "PERS_OPTN_DEATH_DT", "PERS_SSA_DEATH_DT", "CAN_MED_COND", "CAN_INIT_ACT_STAT_DT", 
+                "CAN_AGE_AT_LISTING", "CAN_INIT_ACT_STAT_CD", "CAN_INIT_SRTR_LAB_MELD",
+                "CAN_LAST_STAT", "CAN_LAST_ACT_STAT_DT", "CAN_LISTING_CTR_CD",
+                "CAN_DGN", "CAN_DGN_OSTXT", "CAN_GENDER", "CAN_ABO", "CAN_RACE", "CAN_ETHNICITY_SRTR",
+                "CAN_FUNCTN_STAT", "CAN_AGE_IN_MONTHS_AT_LISTING", "CAN_PRIMARY_PAY", "CAN_BMI")
+
+x2 <- cand_list_with_exceptions %>% filter(all(is.na(CANHX_MPXCPT_CASE_ID))) %>% mutate(EXC = 0) %>%
+  dplyr::select("PX_ID", "PERS_ID", "REC_TX_DT", "CAN_REM_DT", "CAN_REM_CD", 
+                "CAN_REM_COD", "CAN_LISTING_DT", "CAN_DEATH_DT",
+                "PERS_OPTN_DEATH_DT", "PERS_SSA_DEATH_DT", "CAN_MED_COND", "CAN_INIT_ACT_STAT_DT", 
+                "CAN_AGE_AT_LISTING", "CAN_INIT_ACT_STAT_CD", "CAN_INIT_SRTR_LAB_MELD",
+                "CAN_LAST_STAT", "CAN_LAST_ACT_STAT_DT", "CAN_LISTING_CTR_CD",
+                "CAN_DGN", "CAN_DGN_OSTXT", "CAN_GENDER", "CAN_ABO", "CAN_RACE", "CAN_ETHNICITY_SRTR",
+                "CAN_FUNCTN_STAT", "CAN_AGE_IN_MONTHS_AT_LISTING", "CAN_PRIMARY_PAY", "CAN_BMI")
+
+cand_list <- rbind(x1.0, x1.1, x2) %>%
+  mutate(CAN_REM_CD = ifelse(CAN_REM_CD == 15, 3, CAN_REM_CD), 
+         CAN_REM_CD = ifelse(CAN_REM_CD == 7, 2, CAN_REM_CD),
+         CAN_REM_DT = case_when(
+           is.na(CAN_REM_DT) ~ CAN_LAST_ACT_STAT_DT,
+           TRUE ~ CAN_REM_DT))
+
+
+singlelist <- cand_list %>%
+  group_by(PERS_ID) %>% filter(n() == 1)
+
+#Code below isolates candidates who have more than one registration on the kidney waiting list as demonstrated by more than one of the same PERS_ID seen. The goal for the final dataset is to combine all simultaneous registrations on the kidney waiting list into a single registration. We created a variable called OVERLAPPING that identifies whether multiple time periods overlap with each other. We created a variable called TRANSFER that refers to candidates who were transferred from one transplant center to another. We assumed that if, for example, there were two registrations associated with the same PERS_ID but they did not overlap temporally, then they were completely separate registrations and should not be combined into a single registration. 
+multilist <- cand_list %>%
+  group_by(PERS_ID) %>% filter(n() > 1) %>%
+  arrange(PERS_ID, CAN_LISTING_DT) %>%
+  mutate(Int = interval(CAN_LISTING_DT, CAN_REM_DT),
+         OVERLAPPING = map(seq_along(Int), function(x){
+           y = setdiff(seq_along(Int), x)
+           return(any(int_overlaps(Int[x], Int[y])))}),
+         TRANSFER = case_when(
+           any(CAN_REM_CD == 2) ~ 1,
+           all(CAN_REM_CD != 2) ~ 2,
+           TRUE ~ 3),
+         OVERLAPGROUP = case_when(
+           all(OVERLAPPING == FALSE) ~ 1,
+           all(OVERLAPPING == TRUE) ~ 2,
+           TRUE ~ 3))
+
+#This code identifies candidates with multiple registrations that are all temporally separate. No need to combine these registrations into one. For example, a single person (PERS_ID) may have three registrations (three different PX_IDs), but if they were all in different time periods, than they are all separate registrations. Theoretically, this person could have a kidney transplant from each of these three registrations.
+multilist_nooverlap <- multilist %>% filter(OVERLAPGROUP == 1) %>% dplyr::select(-c("Int", "OVERLAPPING", "TRANSFER", "OVERLAPGROUP"))
+
+#This code identifies candidates with some registrations that overlap temporally, but not all of them. By definition, these candidates have to have >2 registrations because candidates with 2 registrations either overlap or do not. 
+  multilist_someoverlap <- multilist %>% filter(OVERLAPGROUP == 3)
+  
+  #Isolates registrations that do not overlap temporally
+  multilist_someoverlap1 <- multilist_someoverlap %>% filter(OVERLAPPING == FALSE) %>% dplyr::select(-c("Int", "OVERLAPPING", "TRANSFER", "OVERLAPGROUP"))
+  
+  #Isolates the registrations that do overlap temporally and should be combined into a single registration
+  multilist_someoverlap2 <- multilist_someoverlap %>% filter(OVERLAPPING == TRUE)
+  
+  #Among the registrations that overlap temporally, identify the ones that are due to transfers to another transplant center. Then among these, identify whether any of the registrations was associated with a DDKT or LDKT. 
+  multilist_someoverlap2.1 <- multilist_someoverlap2 %>% filter(any(CAN_REM_CD == 2)) %>% arrange(PERS_ID, CAN_REM_CD) %>%
+    mutate(GROUP = case_when(
+      any(CAN_REM_CD == 3) | any(CAN_REM_CD == 4) ~ 1,
+      TRUE ~ 2))
+  
+  #From above, combine overlapping registrations into a single registration by making CAN_LISTING_DT the earliest of any of the registrations and the CAN_REM_DT as the transplant date.
+  multilist_someoverlap2.1.1 <- multilist_someoverlap2.1 %>% filter(GROUP == 1) %>% arrange(CAN_LISTING_DT) %>%
+    filter(CAN_REM_CD == 3 | CAN_REM_CD == 4) %>% dplyr::select(-c("Int", "OVERLAPPING", "TRANSFER", "OVERLAPGROUP", "GROUP"))
+  
+  #Same as above but there is no transplant so the CAN_REM_DT is essentially the last CAN_REM_DT recorded for any of the overlapping registrations
+  multilist_someoverlap2.1.2 <- multilist_someoverlap2.1 %>% filter(GROUP == 2) %>% arrange(CAN_LISTING_DT) %>%
+    slice(n()) %>% dplyr::select(-c("Int", "OVERLAPPING", "TRANSFER", "OVERLAPGROUP", "GROUP"))
+  
+  
+  #This code is for patients whose registrations are overlapping temporally but none of them are transfers between transplant centers. This establishes various groups. The reason for this code is that even though several time periods may be coded as OVERLAPPING = TRUE, they are not necessarily simultaneous. Take the example of a person who has 4 registrations. While they may all be coded as OVERLAPPING = TRUE, this does not differentiate between all 4 registrations taking place at the same time and 2 registrations happening simultaneously at one time and the other 2 simultaneously at another. For example, a patient having 2 registrations simultaneously in 2020 and then 2 registrations simultaneously in 2022 is clearly different from a patient having 4 registrations simultaneously in 2020. The following code identifies this difference.
+  multilist_someoverlap2.2 <- multilist_someoverlap2 %>% filter(all(CAN_REM_CD != 2)) %>%
+    mutate(GROUP1 = case_when(
+      sum(CAN_REM_CD == 4) == 1 & !all(CAN_REM_CD == 3) ~ 1,
+      sum(CAN_REM_CD == 3) == 1 & !all(CAN_REM_CD == 4) ~ 2,
+      sum(CAN_REM_CD == 4) > 1 & !all(CAN_REM_CD == 3) ~ 3,
+      sum(CAN_REM_CD == 3) > 1 & !all(CAN_REM_CD == 4) ~ 4,
+      any(CAN_REM_CD == 3) & any(CAN_REM_CD == 4) ~ 5,
+      TRUE ~ 6
+    ))
+  
+  multilist_someoverlap2.2.1 <- multilist_someoverlap2.2 %>% filter(GROUP1 == 1) %>% arrange(CAN_LISTING_DT) %>%
+    filter(CAN_REM_CD == 4) %>% dplyr::select(-c("Int", "OVERLAPPING", "TRANSFER", "OVERLAPGROUP", "GROUP1"))
+  
+  multilist_someoverlap2.2.2 <- multilist_someoverlap2.2 %>% filter(GROUP1 == 2) %>% arrange(CAN_LISTING_DT) %>%
+    filter(CAN_REM_CD == 3) %>% dplyr::select(-c("Int", "OVERLAPPING", "TRANSFER", "OVERLAPGROUP", "GROUP1"))
+  
+  multilist_someoverlap2.2.3 <- multilist_someoverlap2.2 %>% filter(GROUP1 == 3) %>%
+    arrange(PERS_ID, CAN_REM_CD) %>% mutate(COUNTER = row_number()) %>%
+    mutate(GROUP2 = case_when(
+      COUNTER == 1 ~ 1,
+      COUNTER == 2 ~ 2,
+      CAN_REM_CD == 14 & COUNTER != 1 & COUNTER != 2 & abs(as.numeric(difftime(first(CAN_REM_DT), CAN_REM_DT, units = "days"))) <= 30 ~ 1,
+      CAN_REM_CD == 14 & COUNTER != 1 & COUNTER != 2 & abs(as.numeric(difftime(nth(CAN_REM_DT, 2), CAN_REM_DT, units = "days"))) <= 30 ~ 2,
+      CAN_REM_CD == 4 & COUNTER != 1 & COUNTER != 2 ~ 3
+    )) %>% ungroup() %>% group_by(PERS_ID, GROUP2) %>% arrange(CAN_LISTING_DT) %>%
+    filter(CAN_REM_CD == 4) %>% ungroup() %>%
+    dplyr::select(-c("Int", "OVERLAPPING", "TRANSFER", "OVERLAPGROUP", "GROUP1", "GROUP2", "COUNTER"))
+  
+  multilist_someoverlap2.2.4 <- multilist_someoverlap2.2 %>% filter(GROUP1 == 4) %>%
+    arrange(PERS_ID, CAN_REM_CD) %>% mutate(COUNTER = row_number()) %>%
+    mutate(GROUP2 = case_when(
+      COUNTER == 1 ~ 1,
+      COUNTER == 2 ~ 2,
+      CAN_REM_CD == 14 & COUNTER != 1 & COUNTER != 2 & abs(as.numeric(difftime(first(CAN_REM_DT), CAN_REM_DT, units = "days"))) <= 30 ~ 1,
+      CAN_REM_CD == 14 & COUNTER != 1 & COUNTER != 2 & abs(as.numeric(difftime(nth(CAN_REM_DT, 2), CAN_REM_DT, units = "days"))) <= 30 ~ 2,
+    )) %>% ungroup() %>% group_by(PERS_ID, GROUP2) %>% arrange(CAN_LISTING_DT) %>%
+    filter(CAN_REM_CD == 3) %>% ungroup() %>%
+    dplyr::select(-c("Int", "OVERLAPPING", "TRANSFER", "OVERLAPGROUP", "GROUP1", "GROUP2", "COUNTER"))
+  
+  multilist_someoverlap2.2.5 <- multilist_someoverlap2.2 %>% filter(GROUP1 == 5) %>%
+    arrange(PERS_ID, CAN_REM_CD) %>% mutate(COUNTER = row_number()) %>%
+    mutate(GROUP2 = case_when(
+      COUNTER == 1 ~ 1,
+      COUNTER == 2 ~ 2,
+      CAN_REM_CD == 14 & COUNTER != 1 & COUNTER != 2 & abs(as.numeric(difftime(first(CAN_REM_DT), CAN_REM_DT, units = "days"))) <= 30 ~ 1,
+      CAN_REM_CD == 14 & COUNTER != 1 & COUNTER != 2 & abs(as.numeric(difftime(nth(CAN_REM_DT, 2), CAN_REM_DT, units = "days"))) <= 30 ~ 2,
+    )) %>% ungroup() %>% group_by(PERS_ID, GROUP2) %>% arrange(CAN_LISTING_DT) %>%
+    filter(CAN_REM_CD == 3 | CAN_REM_CD == 4) %>% ungroup() %>%
+    dplyr::select(-c("Int", "OVERLAPPING", "TRANSFER", "OVERLAPGROUP", "GROUP1", "GROUP2", "COUNTER"))
+  
+  multilist_someoverlap2.2.6 <- multilist_someoverlap2.2 %>% filter(GROUP1 == 6) %>% arrange(CAN_LISTING_DT) %>%
+    filter(row_number() == 1) %>%
+    dplyr::select(-c("Int", "OVERLAPPING", "TRANSFER", "OVERLAPGROUP", "GROUP1"))
+  
+  #This code identifies candidates who have multiple registrations that ALL overlap temporally. The code for combining these registrations into a single registration is essentially the same as above for the patients in the "Some Overlap Group" with registrations that are overlapping.
+  multilist_overlap <- multilist %>% filter(OVERLAPGROUP == 2)
+  
+  multilist_overlap1 <- multilist_overlap %>% filter(TRANSFER != 1) %>% 
+    mutate(GROUP1 = case_when(
+      sum(CAN_REM_CD == 4) == 1 & !all(CAN_REM_CD == 3) ~ 1,
+      sum(CAN_REM_CD == 3) == 1 & !all(CAN_REM_CD == 4) ~ 2,
+      sum(CAN_REM_CD == 4) > 1 & !all(CAN_REM_CD == 3) ~ 3,
+      sum(CAN_REM_CD == 3) > 1 & !all(CAN_REM_CD == 4) ~ 4,
+      any(CAN_REM_CD == 3) & any(CAN_REM_CD == 4) ~ 5,
+      TRUE ~ 6))
+  
+  multilist_overlap1.1 <- multilist_overlap1 %>% filter(GROUP1 == 1) %>% arrange(CAN_LISTING_DT) %>%
+    filter(CAN_REM_CD == 4) %>% dplyr::select(-c("Int", "OVERLAPPING", "TRANSFER", "OVERLAPGROUP", "GROUP1"))
+  
+  multilist_overlap1.2 <- multilist_overlap1 %>% filter(GROUP1 == 2) %>% arrange(CAN_LISTING_DT) %>%
+    filter(CAN_REM_CD == 3) %>% dplyr::select(-c("Int", "OVERLAPPING", "TRANSFER", "OVERLAPGROUP", "GROUP1"))
+  
+  multilist_overlap1.3 <- multilist_overlap1 %>% filter(GROUP1 == 3) %>%
+    arrange(PERS_ID, CAN_REM_CD) %>% mutate(COUNTER = row_number()) %>%
+    mutate(GROUP2 = case_when(
+      COUNTER == 1 ~ 1,
+      COUNTER == 2 ~ 2,
+      CAN_REM_CD == 14 & COUNTER != 1 & COUNTER != 2 & abs(as.numeric(difftime(first(CAN_REM_DT), CAN_REM_DT, units = "days"))) <= 30 ~ 1,
+      CAN_REM_CD == 14 & COUNTER != 1 & COUNTER != 2 & abs(as.numeric(difftime(nth(CAN_REM_DT, 2), CAN_REM_DT, units = "days"))) <= 30 ~ 2,
+      CAN_REM_CD == 4 & COUNTER != 1 & COUNTER != 2 ~ 3
+    )) %>% ungroup() %>% group_by(PERS_ID, GROUP2) %>% arrange(CAN_LISTING_DT) %>%
+    filter(CAN_REM_CD == 4) %>% ungroup() %>%
+    dplyr::select(-c("Int", "OVERLAPPING", "TRANSFER", "OVERLAPGROUP", "GROUP1", "GROUP2", "COUNTER"))
+  
+  multilist_overlap1.4 <- multilist_overlap1 %>% filter(GROUP1 == 4) %>%
+    arrange(PERS_ID, CAN_REM_CD) %>% mutate(COUNTER = row_number()) %>%
+    mutate(GROUP2 = case_when(
+      COUNTER == 1 ~ 1,
+      COUNTER == 2 ~ 2,
+      CAN_REM_CD == 14 & COUNTER != 1 & COUNTER != 2 & abs(as.numeric(difftime(first(CAN_REM_DT), CAN_REM_DT, units = "days"))) <= 30 ~ 1,
+      CAN_REM_CD == 14 & COUNTER != 1 & COUNTER != 2 & abs(as.numeric(difftime(nth(CAN_REM_DT, 2), CAN_REM_DT, units = "days"))) <= 30 ~ 2,
+    )) %>% ungroup() %>% group_by(PERS_ID, GROUP2) %>% arrange(CAN_LISTING_DT) %>%
+    filter(CAN_REM_CD == 3) %>% ungroup() %>%
+    dplyr::select(-c("Int", "OVERLAPPING", "TRANSFER", "OVERLAPGROUP", "GROUP1", "GROUP2", "COUNTER"))
+  
+  multilist_overlap1.5 <- multilist_overlap1 %>% filter(GROUP1 == 5) %>%
+    arrange(PERS_ID, CAN_REM_CD) %>% mutate(COUNTER = row_number()) %>%
+    mutate(GROUP2 = case_when(
+      COUNTER == 1 ~ 1,
+      COUNTER == 2 ~ 2,
+      CAN_REM_CD == 14 & COUNTER != 1 & COUNTER != 2 & abs(as.numeric(difftime(first(CAN_REM_DT), CAN_REM_DT, units = "days"))) <= 30 ~ 1,
+      CAN_REM_CD == 14 & COUNTER != 1 & COUNTER != 2 & abs(as.numeric(difftime(nth(CAN_REM_DT, 2), CAN_REM_DT, units = "days"))) <= 30 ~ 2,
+    )) %>% ungroup() %>% group_by(PERS_ID, GROUP2) %>% arrange(CAN_LISTING_DT) %>%
+    filter(CAN_REM_CD == 3 | CAN_REM_CD == 4) %>% ungroup() %>%
+    dplyr::select(-c("Int", "OVERLAPPING", "TRANSFER", "OVERLAPGROUP", "GROUP1", "GROUP2", "COUNTER"))
+  
+  multilist_overlap1.6 <- multilist_overlap1 %>% filter(GROUP1 == 6) %>% arrange(CAN_LISTING_DT) %>%
+    filter(row_number() == 1) %>%
+    dplyr::select(-c("Int", "OVERLAPPING", "TRANSFER", "OVERLAPGROUP", "GROUP1"))
+    
+  multilist_overlap2 <- multilist_overlap %>% filter(TRANSFER == 1) %>% arrange(PERS_ID, CAN_REM_CD) %>% 
+    mutate(GROUP = case_when(
+      any(CAN_REM_CD == 3) | any(CAN_REM_CD == 4) ~ 1,
+      TRUE ~ 2))
+  
+  multilist_overlap2.1 <- multilist_overlap2 %>% filter(GROUP == 1) %>% arrange(CAN_LISTING_DT) %>%
+    filter(CAN_REM_CD == 3 | CAN_REM_CD == 4) %>% dplyr::select(-c("Int", "OVERLAPPING", "TRANSFER", "OVERLAPGROUP", "GROUP"))
+  
+  multilist_overlap2.2 <- multilist_overlap2 %>% filter(GROUP == 2) %>% arrange(CAN_LISTING_DT) %>%
+    slice(n()) %>% dplyr::select(-c("Int", "OVERLAPPING", "TRANSFER", "OVERLAPGROUP", "GROUP"))
+  
+  
+  #This code combines all of the above datasets into a single candidate_list, which accomplishes our goal of creating a dataframe in which there is only one PX_ID per PERS_ID at a particular waiting time. 
+  candidate_list <- rbind(singlelist, multilist_nooverlap, multilist_someoverlap1, multilist_someoverlap2.1.1, multilist_someoverlap2.1.2,
+                          multilist_someoverlap2.2.1, multilist_someoverlap2.2.2, multilist_someoverlap2.2.3, multilist_someoverlap2.2.4,
+                          multilist_someoverlap2.2.5, multilist_someoverlap2.2.6, multilist_overlap1.1, multilist_overlap1.2, multilist_overlap1.3,
+                          multilist_overlap1.4, multilist_overlap1.5, multilist_overlap1.6, multilist_overlap2.1, multilist_overlap2.2) %>%
+    arrange(PERS_ID, CAN_LISTING_DT) %>% ungroup() %>% group_by(PERS_ID) %>%
+    mutate(REGISTRATION_PERIOD = row_number()) %>% arrange(PERS_ID, REGISTRATION_PERIOD)
+
+
+kipa <- cand_kipa2024q1 %>% dplyr::select(c("PERS_ID", "WL_ORG", "CAN_LISTING_DT", "CAN_REM_DT", "CAN_REM_CD", "REC_TX_DT", "CAN_LAST_ACT_STAT_DT"))
+intestine <- cand_liin2024q1 %>% filter(WL_ORG == "IN") %>% dplyr::select(c("PERS_ID", "WL_ORG", "CAN_LISTING_DT", "CAN_REM_DT", "CAN_REM_CD", "REC_TX_DT", "CAN_LAST_ACT_STAT_DT"))
+thor <- cand_thor2024q1 %>% dplyr::select(c("PERS_ID", "WL_ORG", "CAN_LISTING_DT", "CAN_REM_DT", "CAN_REM_CD", "REC_TX_DT", "CAN_LAST_ACT_STAT_DT"))
+solidorgan <- rbind(kipa, intestine, thor) %>% rename(MULTI_ORGAN_LISTING_DT = CAN_LISTING_DT, MULTI_ORGAN_REMOVAL_DT = CAN_REM_DT, 
+                                                     PRIOR_ORGAN_TRANSPLANT_DT = REC_TX_DT, PRIOR_REM_CD = CAN_REM_CD) %>%
+  mutate(MULTI_ORGAN_REMOVAL_DT = case_when(
+    !is.na(WL_ORG) & is.na(MULTI_ORGAN_REMOVAL_DT) ~ CAN_LAST_ACT_STAT_DT,
+    TRUE ~ MULTI_ORGAN_REMOVAL_DT))
+
+#This code left joins our candidate_list with "solidorgan." We created a variable MULTI_ORGAN that is equivalent to 1 if a candidate is already on a solid organ waiting list when they are listed for a kidney or if they are listed for another solid organ while on the kidney waiting list. If equivalent to 1, MULTI_ORGAN is always associated with a MULTI_ORGAN_LISTING_DT, which can be used for censoring. Of note, these variables account for the earliest time that a patient is listed for another solid organ. There are cases where patients can be listed for two solid organs in addition to a kidney, such as a heart and a liver. In these cases, MULTI_ORGAN = 1 for whichever of the heart and liver the patient is listed earlier. IT IS IMPORTANT TO NOTE that MULTI_ORGAN is not equal to 1 in cases of prior transplants. For example, if a patient is listed from 2022 to 2023 and had a kidney transplant in 1998, MULTI_ORGAN is not equal to 1. 
+
+candidate_list <- merge(candidate_list, solidorgan, by = "PERS_ID", all.x = TRUE) %>% group_by(PERS_ID, REGISTRATION_PERIOD) %>%
+  mutate(MULTI_ORGAN = case_when(
+    is.na(WL_ORG) | is.na(MULTI_ORGAN_LISTING_DT) ~ 0,
+    CAN_LISTING_DT > MULTI_ORGAN_LISTING_DT & CAN_LISTING_DT > MULTI_ORGAN_REMOVAL_DT ~ 0,
+    CAN_LISTING_DT >= MULTI_ORGAN_LISTING_DT & CAN_LISTING_DT <= MULTI_ORGAN_REMOVAL_DT ~ 1,
+    CAN_LISTING_DT < MULTI_ORGAN_LISTING_DT & CAN_REM_DT < MULTI_ORGAN_LISTING_DT ~ 0,
+    CAN_LISTING_DT <= MULTI_ORGAN_LISTING_DT & CAN_REM_DT >= MULTI_ORGAN_LISTING_DT ~ 2)) %>%
+  rename(LAST_DATE_OTHER_ORGAN = CAN_LAST_ACT_STAT_DT.y,
+         CAN_LAST_ACT_STAT_DT = CAN_LAST_ACT_STAT_DT.x)
+
+#For candidates listed on other solid organ waiting lists, this code selects for the earliest multi organ listing date. 
+candidate_list_singleorgan <- candidate_list %>% filter(all(MULTI_ORGAN == 0)) %>% 
+  arrange(PERS_ID, REGISTRATION_PERIOD, MULTI_ORGAN_LISTING_DT) %>% slice(1)
+
+candidate_list_multiorgan <- candidate_list %>% filter(any(MULTI_ORGAN != 0)) %>% filter(MULTI_ORGAN != 0) %>%
+  arrange(PERS_ID, REGISTRATION_PERIOD, MULTI_ORGAN_LISTING_DT) %>% slice(1)
+
+#This is our final base dataset. We create a variable PREV_TX which denotes whether patient has previously received a solid organ transplant.
+candidatelist <- rbind(candidate_list_multiorgan, candidate_list_singleorgan) %>% ungroup() %>% group_by(PERS_ID) %>% arrange(PERS_ID, REGISTRATION_PERIOD)
+
+candidatelist <- candidatelist %>% filter(MULTI_ORGAN != 1)
+#x1 <- x1 %>% dplyr::select("PX_ID", "CANHX_MPXCPT_DGN", "CANHX_MPXCPT_STAT", "EXC")
+  
+
+
+```
+
+```{r survival analysis set up}
+candidatelist <- candidatelist %>%
+  mutate(
+    DEATH_DT = case_when(
+      !is.na(PERS_OPTN_DEATH_DT) ~ PERS_OPTN_DEATH_DT,
+      is.na(PERS_OPTN_DEATH_DT) & !is.na(PERS_SSA_DEATH_DT) ~ PERS_SSA_DEATH_DT,
+      is.na(PERS_OPTN_DEATH_DT) & is.na(PERS_SSA_DEATH_DT) & !is.na(CAN_DEATH_DT) ~ CAN_DEATH_DT))
+
+
+
+candidatelist$PRE_TX_DEATH <- ifelse(candidatelist$CAN_REM_CD == 8 | 
+                         (candidatelist$CAN_REM_CD == 5 & !is.na(candidatelist$DEATH_DT) & as.numeric(difftime(candidatelist$DEATH_DT, candidatelist$CAN_LISTING_DT, units = "days")) <= 180) |
+                         (candidatelist$CAN_REM_CD == 6 & !is.na(candidatelist$DEATH_DT) & as.numeric(difftime(candidatelist$DEATH_DT, candidatelist$CAN_LISTING_DT, units = "days")) <= 180) |
+                         (candidatelist$CAN_REM_CD == 7 & !is.na(candidatelist$DEATH_DT) & as.numeric(difftime(candidatelist$DEATH_DT, candidatelist$CAN_LISTING_DT, units = "days")) <= 180) |
+                         (candidatelist$CAN_REM_CD == 9 & !is.na(candidatelist$DEATH_DT) & as.numeric(difftime(candidatelist$DEATH_DT, candidatelist$CAN_LISTING_DT, units = "days")) <= 180) |
+                         (candidatelist$CAN_REM_CD == 10 & !is.na(candidatelist$DEATH_DT) & as.numeric(difftime(candidatelist$DEATH_DT, candidatelist$CAN_LISTING_DT, units = "days")) <= 180) |
+                         (candidatelist$CAN_REM_CD == 11 & !is.na(candidatelist$DEATH_DT) & as.numeric(difftime(candidatelist$DEATH_DT, candidatelist$CAN_LISTING_DT, units = "days")) <= 180) |
+                         (candidatelist$CAN_REM_CD == 12 & !is.na(candidatelist$DEATH_DT) & as.numeric(difftime(candidatelist$DEATH_DT, candidatelist$CAN_LISTING_DT, units = "days")) <= 180) |
+                         (candidatelist$CAN_REM_CD == 13 & !is.na(candidatelist$DEATH_DT) & as.numeric(difftime(candidatelist$DEATH_DT, candidatelist$CAN_LISTING_DT, units = "days")) <= 180) |
+                         (candidatelist$CAN_REM_CD == 16 & !is.na(candidatelist$DEATH_DT) & as.numeric(difftime(candidatelist$DEATH_DT, candidatelist$CAN_LISTING_DT, units = "days")) <= 180) |
+                         (candidatelist$CAN_REM_CD == 17 & !is.na(candidatelist$DEATH_DT) & as.numeric(difftime(candidatelist$DEATH_DT, candidatelist$CAN_LISTING_DT, units = "days")) <= 180) |
+                         (candidatelist$CAN_REM_CD == 20 & !is.na(candidatelist$DEATH_DT) & as.numeric(difftime(candidatelist$DEATH_DT, candidatelist$CAN_LISTING_DT, units = "days")) <= 180) |
+                         (candidatelist$CAN_REM_CD == 24 & !is.na(candidatelist$DEATH_DT) & as.numeric(difftime(candidatelist$DEATH_DT, candidatelist$CAN_LISTING_DT, units = "days")) <= 180), 1, 0)
+
+
+candidatelist <- candidatelist %>% mutate(PRE_TX_DEATH = ifelse(is.na(PRE_TX_DEATH), 0, PRE_TX_DEATH))
+
+#p1$MULTI_LISTING_DT <- as.Date(p1$MULTI_LISTING_DT, origin = "1970-01-01")
+
+candidatelist$DEATH_DT <- as.Date(candidatelist$DEATH_DT, origin = "1970-01-01")
+candidatelist$REC_TX_DT <- as.Date(candidatelist$REC_TX_DT, origin = "1970-01-01")
+
+candidatelist <- candidatelist %>% mutate(REMOVAL_DATE = case_when(CAN_REM_CD == 8 |
+                                            (CAN_REM_CD == 5 & !is.na(DEATH_DT) & as.numeric(difftime(DEATH_DT, CAN_LISTING_DT, units = "days")) <= 180) |
+                                            (CAN_REM_CD == 6 & !is.na(DEATH_DT) & as.numeric(difftime(DEATH_DT, CAN_LISTING_DT, units = "days")) <= 180) |
+                                            (CAN_REM_CD == 7 & !is.na(DEATH_DT) & as.numeric(difftime(DEATH_DT, CAN_LISTING_DT, units = "days")) <= 180) |
+                                            (CAN_REM_CD == 9 & !is.na(DEATH_DT) & as.numeric(difftime(DEATH_DT, CAN_LISTING_DT, units = "days")) <= 180) |
+                                            (CAN_REM_CD == 10 & !is.na(DEATH_DT) & as.numeric(difftime(DEATH_DT, CAN_LISTING_DT, units = "days")) <= 180) |
+                                            (CAN_REM_CD == 12 & !is.na(DEATH_DT) & as.numeric(difftime(DEATH_DT, CAN_LISTING_DT, units = "days")) <= 180) |
+                                            (CAN_REM_CD == 13 & !is.na(DEATH_DT) & as.numeric(difftime(DEATH_DT, CAN_LISTING_DT, units = "days")) <= 180) |
+                                            (CAN_REM_CD == 16 & !is.na(DEATH_DT) & as.numeric(difftime(DEATH_DT, CAN_LISTING_DT, units = "days")) <= 180) |
+                                            (CAN_REM_CD == 17 & !is.na(DEATH_DT) & as.numeric(difftime(DEATH_DT, CAN_LISTING_DT, units = "days")) <= 180) |
+                                            (CAN_REM_CD == 20 & !is.na(DEATH_DT) & as.numeric(difftime(DEATH_DT, CAN_LISTING_DT, units = "days")) <= 180) |
+                                            (CAN_REM_CD == 24 & !is.na(DEATH_DT) & as.numeric(difftime(DEATH_DT, CAN_LISTING_DT, units = "days")) <= 180) ~ DEATH_DT,
+                                            TRUE ~ CAN_REM_DT))
+
+candidatelist$REMOVAL_DATE <- as.Date(candidatelist$REMOVAL_DATE, origin = "1970-01-01")
+
+candidatelist <- candidatelist %>%
+  mutate(
+    LASTDATE = case_when(
+      is.na(REMOVAL_DATE) ~ CAN_LAST_ACT_STAT_DT,
+      TRUE ~ REMOVAL_DATE
+    )
+  )
+
+candidatelist <- candidatelist %>%
+  mutate(
+    REMOVAL_CAUSE = case_when(
+      MULTI_ORGAN == 2 ~ 0,
+      MULTI_ORGAN != 2 & PRE_TX_DEATH == 1 ~ 1,
+      MULTI_ORGAN != 2 & (CAN_REM_CD == 4 | CAN_REM_CD == 14 | CAN_REM_CD == 21) ~ 2,
+      MULTI_ORGAN != 2 & is.na(CAN_REM_CD) ~ 3,
+      TRUE ~ 4
+    )
+  )
+
+candidatelist <- candidatelist %>%
+  mutate(
+    TRANSPLANT = case_when(
+      MULTI_ORGAN != 2 & (CAN_REM_CD == 4 | CAN_REM_CD == 14 | CAN_REM_CD == 21) ~ 1,
+      TRUE ~ 0)
+    )
+
+candidatelist <- candidatelist %>%
+  mutate(
+    FINAL_REMOVAL_DATE = case_when(
+      REMOVAL_CAUSE == 0 ~ MULTI_ORGAN_LISTING_DT,
+      REMOVAL_CAUSE == 1 ~ DEATH_DT,
+      REMOVAL_CAUSE == 2 ~ CAN_REM_DT,
+      REMOVAL_CAUSE == 3 ~ CAN_LAST_ACT_STAT_DT,
+      REMOVAL_CAUSE == 4 ~ CAN_REM_DT
+    )
+  )
+
+candidatelist <- candidatelist %>%
+  mutate(TIME_TO_REMOVAL = as.numeric(difftime(FINAL_REMOVAL_DATE, CAN_LISTING_DT, units = "days")))
+
+candidatelist <- candidatelist %>%
+  mutate(TIME_TO_REMOVAL_YEARS = TIME_TO_REMOVAL / 365.25)
+
+candidatelist <- candidatelist %>% mutate(
+  POLICY_COHORT = case_when(
+    (CAN_LISTING_DT >= as.POSIXct("2016-06-01") & CAN_LISTING_DT <= as.POSIXct("2019-04-30")) ~ "Pre-Policy",
+    (CAN_LISTING_DT >= as.POSIXct("2019-06-01") & CAN_LISTING_DT <= as.POSIXct("2022-04-30")) ~ "Post-Policy",
+    (CAN_LISTING_DT >= as.POSIXct("2019-05-01") & CAN_LISTING_DT <= as.POSIXct("2019-05-31")) ~ "Between"
+  )
+) %>% ungroup()
+
+
+institution <- institution2024q1 %>% 
+  rename(CAN_LISTING_CTR_CD = CTR_CD)
+candidatelistwithregion <- merge(x = candidatelist, y = institution, by = "CAN_LISTING_CTR_CD", all.x = TRUE) %>%
+  filter(CTR_TY == "TX1")
+
+```
+
+```{r creating time-varying dataset}
+
+candidates <- merge(x = candidatelistwithregion, y = stathist_liin2024q1, by = "PX_ID", all.x = TRUE)
+
+candidates <- candidates %>% 
+  rename(CAN_INIT_ACT_STAT_DT = CAN_INIT_ACT_STAT_DT.x, 
+         CAN_INIT_ACT_STAT_CD = CAN_INIT_ACT_STAT_CD.x, CAN_LAST_STAT = CAN_LAST_STAT.x,
+         CAN_LAST_ACT_STAT_DT = CAN_LAST_ACT_STAT_DT.x, CAN_GENDER = CAN_GENDER.x,
+         CAN_INIT_SRTR_LAB_MELD = CAN_INIT_SRTR_LAB_MELD.x,
+         CAN_REM_DT = CAN_REM_DT.x, 
+         CAN_LISTING_DT = CAN_LISTING_DT.x, 
+         CAN_REM_CD = CAN_REM_CD.x)
+
+candidates <- dplyr::select(candidates, "PX_ID", "PERS_ID", "POLICY_COHORT", "REC_TX_DT", "CAN_REM_DT", "CAN_REM_CD", 
+                      "CAN_REM_COD", "CAN_LISTING_DT", "CANHX_BEGIN_DT", "CANHX_END_DT", "CAN_DEATH_DT",
+                      "PERS_OPTN_DEATH_DT", "PERS_SSA_DEATH_DT", "CANHX_EXC_FLG", "CAN_MED_COND", 
+                      "CANHX_EXC_SCORE", "CANHX_EXC_DIAG_OTHER", "CANHX_OPTN_LAB_MELD", 
+                      "CANHX_SRTR_LAB_MELD", "CANHX_STAT_CD", "CANHX_MELD_DIFF_REASON_CD", "CANHX_EXC_DIAG_HCC1",
+                      "CANHX_EXC_DIAG_HCC2", "CANHX_EXC_DIAG_HCC_NOPOLICY", "CAN_INIT_ACT_STAT_DT", 
+                      "CAN_AGE_AT_LISTING", "CAN_INIT_ACT_STAT_CD", "CAN_INIT_SRTR_LAB_MELD",
+                      "CAN_LAST_STAT", "CAN_LAST_ACT_STAT_DT", "CAN_LISTING_CTR_CD", "TRANSPLANT",
+                      "CAN_DGN", "CAN_DGN_OSTXT", "CAN_GENDER", "CAN_ABO", "CAN_RACE", "CAN_ETHNICITY_SRTR", "REGION",
+                      "CAN_FUNCTN_STAT", "CAN_AGE_IN_MONTHS_AT_LISTING", "CAN_PRIMARY_PAY", "CAN_BMI",
+                      "DEATH_DT", "PRE_TX_DEATH", "REMOVAL_DATE", "LASTDATE", "REMOVAL_CAUSE",
+                      "FINAL_REMOVAL_DATE", "TIME_TO_REMOVAL", "TIME_TO_REMOVAL_YEARS", 
+                      "CANHX_BILI", "CANHX_SERUM_CREAT", "CANHX_DIAL_PRIOR_WEEK",
+                      "CANHX_INR", "CANHX_SERUM_SODIUM")
+
+candidates <- candidates %>% group_by(PX_ID) %>% arrange(CANHX_BEGIN_DT) %>% mutate(CANHX_DIAL_PRIOR_WEEK = na_if(CANHX_DIAL_PRIOR_WEEK, ""),
+                                  CANHX_MELD_DIFF_REASON_CD = ifelse(is.na(CANHX_MELD_DIFF_REASON_CD), 0, CANHX_MELD_DIFF_REASON_CD),
+                                  DIALYSIS = case_when(
+                                    CANHX_DIAL_PRIOR_WEEK == "N" | CANHX_DIAL_PRIOR_WEEK == "A" ~ 0,
+                                    CANHX_DIAL_PRIOR_WEEK == "Y" ~ 1),
+                                  MELD_CALC = case_when(
+                                    !is.na(CANHX_BILI) & !is.na(CANHX_DIAL_PRIOR_WEEK) ~ round(meld_na(CANHX_INR, CANHX_BILI, CANHX_SERUM_CREAT, CANHX_SERUM_SODIUM, DIALYSIS, units = "US")),
+                                    TRUE ~ CANHX_SRTR_LAB_MELD - 6200))
+                                
+#this code lets us censor patients when they obtain Status 1
+
+status1 <- candidates %>%
+  group_by(PX_ID) %>%
+  arrange(PX_ID, CANHX_BEGIN_DT) %>%
+  filter(any(CANHX_STAT_CD == 6011)) %>%
+  mutate(STATUS1 = as.numeric(row_number() == min(row_number()[CANHX_STAT_CD == 6011]))) %>%
+  filter(row_number() <= which.max(STATUS1) | all(STATUS1 == 0)) %>%
+  filter(row_number() <= n()-1) %>%
+  mutate(PRE_TX_DEATH = ifelse(PRE_TX_DEATH == 1, 0, PRE_TX_DEATH)) %>%
+  ungroup()
+status1$STATUS1 <- NULL
+
+nonstatus1 <- candidates %>%
+  group_by(PX_ID) %>%
+  arrange(PX_ID, CANHX_BEGIN_DT) %>%
+  filter(!any(CANHX_STAT_CD == 6011)) %>%
+  ungroup()
+
+candidates <- rbind(status1, nonstatus1) %>% group_by(PX_ID) %>% arrange(PX_ID, CANHX_BEGIN_DT)
+
+candidates <- candidates %>%
+  mutate(
+    EXCEPTION = case_when(
+      ((CANHX_MELD_DIFF_REASON_CD == 3 | CANHX_MELD_DIFF_REASON_CD == 7) & CANHX_EXC_FLG == 1) ~ 1,
+      TRUE ~ 0),
+    ALLOCATION_SCORE = case_when(
+      CANHX_STAT_CD == 6999 & ((CANHX_OPTN_LAB_MELD - 6200) > 40) ~ 40,
+      CANHX_STAT_CD == 6999 & ((CANHX_OPTN_LAB_MELD - 6200) <= 40) ~ CANHX_OPTN_LAB_MELD - 6200,
+      is.na(CANHX_OPTN_LAB_MELD) & !is.na(CANHX_SRTR_LAB_MELD) & ((CANHX_SRTR_LAB_MELD - 6200) <= 40) ~ CANHX_SRTR_LAB_MELD - 6200,
+      TRUE ~ CANHX_STAT_CD - 6200),
+    LAB_SCORE = case_when(
+      (!is.na(CANHX_OPTN_LAB_MELD)) & (CANHX_OPTN_LAB_MELD - 6200 > 40) ~ 40,
+      is.na(CANHX_OPTN_LAB_MELD) ~ CANHX_SRTR_LAB_MELD - 6200,
+      TRUE ~ CANHX_OPTN_LAB_MELD - 6200))
+
+
+timeseries <- candidates %>% group_by(PX_ID) %>% arrange(PX_ID, CANHX_BEGIN_DT) %>%
+  mutate(TIME1 = as.numeric(difftime(CANHX_BEGIN_DT, CAN_LISTING_DT, units = "days")),
+         TIME2 = as.numeric(difftime(CANHX_END_DT, CAN_LISTING_DT, units = "days")) + 1,
+         TIME2 = case_when(
+           is.na(TIME2) ~ as.numeric(difftime(FINAL_REMOVAL_DATE, CAN_LISTING_DT, units = "days")),
+           TRUE ~ TIME2),
+         sex = ifelse(CAN_GENDER == "M", "Male", "Female"),
+         sex = factor(sex, levels = c("Male", "Female")),
+         bmi = case_when(
+           CAN_BMI < 18 ~ "Underweight",
+           CAN_BMI >= 18 & CAN_BMI < 25 ~ "Normal",
+           CAN_BMI >= 25 & CAN_BMI < 30 ~ "Overweight",
+           CAN_BMI >= 30 ~ "Obese",
+           TRUE ~ "Unknown"),
+         bmi = factor(bmi, levels = c("Normal", "Underweight", "Overweight", "Obese", "Unknown")),
+         yearoflisting = case_when(
+           CAN_LISTING_DT >= as.POSIXct("2016-06-01") & CAN_LISTING_DT <= as.POSIXct("2016-12-31") ~ "2016",
+           CAN_LISTING_DT >= as.POSIXct("2017-01-01") & CAN_LISTING_DT <= as.POSIXct("2017-12-31") ~ "2017",
+           CAN_LISTING_DT >= as.POSIXct("2018-01-01") & CAN_LISTING_DT <= as.POSIXct("2018-12-31") ~ "2018",
+           CAN_LISTING_DT >= as.POSIXct("2019-01-01") & CAN_LISTING_DT <= as.POSIXct("2019-12-31") ~ "2019",
+           CAN_LISTING_DT >= as.POSIXct("2020-01-01") & CAN_LISTING_DT <= as.POSIXct("2020-12-31") ~ "2020",
+           CAN_LISTING_DT >= as.POSIXct("2021-01-01") & CAN_LISTING_DT <= as.POSIXct("2021-12-31") ~ "2021",
+           CAN_LISTING_DT >= as.POSIXct("2022-01-01") & CAN_LISTING_DT <= as.POSIXct("2022-04-30") ~ "2022"),
+         yearoflisting = factor(yearoflisting, levels = c("2016", "2017", "2018", "2019", "2020", "2021", "2022")),
+         race = case_when(
+           is.na(CAN_RACE) & CAN_ETHNICITY_SRTR == "LATINO" ~ "Hispanic/Latino",
+           CAN_RACE == 8 & CAN_ETHNICITY_SRTR == "NLATIN" ~ "White",
+           CAN_RACE == 16 & CAN_ETHNICITY_SRTR == "NLATIN" ~ "Black",
+           CAN_RACE == 64 & CAN_ETHNICITY_SRTR == "NLATIN" ~ "Asian",
+           TRUE ~ "Other"),
+         race = factor(race, levels = c("White", "Black", "Hispanic/Latino", "Asian", "Other")),
+         age = CAN_AGE_AT_LISTING,
+         functional = case_when(
+           (CAN_FUNCTN_STAT == 2010 | CAN_FUNCTN_STAT == 2020 | CAN_FUNCTN_STAT == 2030 | CAN_FUNCTN_STAT == 2040) ~ "Low",
+           (CAN_FUNCTN_STAT == 2050 | CAN_FUNCTN_STAT == 2060 | CAN_FUNCTN_STAT == 2070) ~ "Intermediate",
+           (CAN_FUNCTN_STAT == 2080 | CAN_FUNCTN_STAT == 2090 | CAN_FUNCTN_STAT == 2100) ~ "High",
+           TRUE ~ "Unknown"),
+         functional = factor(functional, levels = c("High", "Intermediate", "Low", "Unknown")),
+         payor = case_when(
+           CAN_PRIMARY_PAY %in% c(2,3,4,5,6,7,13) ~ "Public",
+           CAN_PRIMARY_PAY == 1 ~ "Private",
+           TRUE ~ "Other"),
+         payor = factor(payor, levels = c("Private", "Public", "Other")))
+
+timeseries1 <- timeseries %>% ungroup() %>% mutate(
+  DELETE = case_when(
+    (TIME1 > TIME2) & is.na(CANHX_END_DT) ~ 1,
+    TRUE ~ 0),
+  SCORE_DIFFERENCE = case_when(
+    EXCEPTION == 1 ~ ALLOCATION_SCORE - LAB_SCORE,
+    TRUE ~ 0
+  )) %>% subset(DELETE == 0) %>% group_by(PX_ID) %>% arrange(PX_ID, CANHX_BEGIN_DT)
+
+deaths <- timeseries1 %>% filter(any(PRE_TX_DEATH == 1)) %>% 
+  filter(row_number() == n()) %>% mutate(NEW_DEATH = 1)
+nodeaths <- timeseries1 %>% filter(any(PRE_TX_DEATH == 1)) %>% 
+  filter(row_number() != n()) %>% mutate(NEW_DEATH = 0)
+nodeaths1 <- timeseries1 %>% filter(!any(PRE_TX_DEATH == 1)) %>% mutate(NEW_DEATH = 0)
+
+timeseries1 <- rbind(deaths, nodeaths, nodeaths1) %>% 
+  group_by(PX_ID) %>% arrange(PX_ID, CANHX_BEGIN_DT)
+
+transplants <- timeseries1 %>% filter(any(TRANSPLANT == 1)) %>% 
+  filter(row_number() == n()) %>% mutate(TX = 1)
+notransplants <- timeseries1 %>% filter(any(TRANSPLANT == 1)) %>% 
+  filter(row_number() != n()) %>% mutate(TX = 0)
+notransplants1 <- timeseries1 %>% filter(!any(TRANSPLANT == 1)) %>% mutate(TX = 0)
+
+timeseries1 <- rbind(transplants, notransplants, notransplants1) %>%
+  group_by(PX_ID) %>% arrange(PX_ID, CANHX_BEGIN_DT) 
+
+
+timeseries1 <- timeseries1 %>% mutate(REC_EXCEPTION = ifelse((any(EXCEPTION == 1)), 1, 0)) %>% mutate(REC_TX = ifelse((any(TX == 1)), 1, 0)) %>%
+  mutate(EXC_WITHIN_WK = case_when(
+    any(EXCEPTION == 1 & TIME1 < 8) ~ 1,
+    TRUE ~ 0)) 
+
+timeseries1 <- timeseries1 %>% group_by(PX_ID) %>% arrange(PX_ID, CANHX_BEGIN_DT) %>% mutate(Count = n())
+
+exceptionwithinweek <- timeseries1 %>% filter(!any(EXCEPTION == 1 & TIME1 < 8)) %>%
+  filter(row_number() == 1)
+
+timeseries2 <- timeseries1 %>% ungroup() %>% group_by(PX_ID) %>% arrange(PX_ID, desc(EXCEPTION), TIME1)
+
+notexceptionwithinweek <- timeseries2 %>% filter(any(EXCEPTION == 1 & TIME1 < 8)) %>% 
+  filter(row_number() == 1) 
+
+finaldataset <- rbind(exceptionwithinweek, notexceptionwithinweek)
+
+timeseriesdata <- timeseries1 %>%
+  mutate(
+    CAN_DGN = ifelse(CAN_DGN == 999 &
+                       (CAN_DGN_OSTXT == "POLYCYSTIC LIVER DISEASE" |
+                        CAN_DGN_OSTXT == "PCLD/PCKD" |
+                        CAN_DGN_OSTXT == "POLYCYSTIC LIVER AND KIDNEY DISEASE" |
+                        CAN_DGN_OSTXT == "POLYCYSTIC LIVER" | 
+                        CAN_DGN_OSTXT == "POLYCYSTIC KIDNEYS" |
+                        CAN_DGN_OSTXT == "POLYCYSTIC LIVER / KIDNEY" |
+                        CAN_DGN_OSTXT == "POLYCYSTIC KIDNEY DISEASE" |
+                        CAN_DGN_OSTXT == "POLYCYSTIC DISEASE" |
+                        CAN_DGN_OSTXT == "POLYCYCTIC LIVER" | 
+                        CAN_DGN_OSTXT == "AUTOSOMAL DOMINANT POLYCYSTIC LIVER DISEASE?" |  
+                        CAN_DGN_OSTXT == "POLYCYSTIC LIVER AND KIDNEY"), 4451, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 &
+                       (CAN_DGN_OSTXT == "NASH" |
+                        CAN_DGN_OSTXT == "NAFLD"), 4214, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 & 
+                       (CAN_DGN_OSTXT == "CYSTIC FIBROSIS" |
+                        CAN_DGN_OSTXT == "CYSTIC FIBROSIS - LIVER"), 4285, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 & 
+                       (CAN_DGN_OSTXT == "ISCHEMIC CHOLANGIOPATHY" |
+                        CAN_DGN_OSTXT == "ISCHEMIC CHOLANGITIS" |
+                        CAN_DGN_OSTXT == "DIFFUSE ISCHEMIC CHOLANGIOPATHY" |
+                        CAN_DGN_OSTXT == "POST OLT BILIARY STRICTURES" | 
+                        CAN_DGN_OSTXT == "ALLOGRAFT FAILURE FROM ISCHEMIC CHOLANGIOPATHY" | 
+                        CAN_DGN_OSTXT == "ISCHEMIC INJURY" | 
+                        CAN_DGN_OSTXT == "DIFFUSE CHOLANGIOPATHY" | 
+                        CAN_DGN_OSTXT == "BILIARY STRICTURES/CHOLANGIOPATHY" | 
+                        CAN_DGN_OSTXT == "ISCHEMIC CHOLANGIOPATHY POST LIVER TRANSPLANT" | 
+                        CAN_DGN_OSTXT == "RECURRENT CHOLANGITIS/BILIARY STRICTURES" | 
+                        CAN_DGN_OSTXT == "ISCHEMIC CHOLANGIO" | 
+                        CAN_DGN_OSTXT == "ISCHEMIC BILE DUCT DISEASE" | 
+                        CAN_DGN_OSTXT == "RECURRENT ISCHEMIC CHOLANGITIS" | 
+                        CAN_DGN_OSTXT == "ISCHEMIC CHOLANGIOPATHY K83.8" | 
+                        CAN_DGN_OSTXT == "RECURRENT CHOLANGITIS" |
+                        CAN_DGN_OSTXT == "RECURRENT CHOLANGITIS S/P OLTX" |
+                        CAN_DGN_OSTXT == "BILIARY CHOLANGIOPATHY" | 
+                        CAN_DGN_OSTXT == "CHOLANGIOPATHY, RECURRENT CHOLANGITIS" | 
+                        CAN_DGN_OSTXT == "ISCHEMIC CHOLANGIO" | 
+                        CAN_DGN_OSTXT == "PERSISTENT BILIARY STRICTURE" | 
+                        CAN_DGN_OSTXT == "BILIARY STRICTURES" | 
+                        CAN_DGN_OSTXT == "ISCHEMIC BILIOPATHY S/P OLT AUGUST 2017" | 
+                        CAN_DGN_OSTXT == "ISCHEMIC CHOLANGIOPATHY OF TRANSPLANTED LIVER" |
+                        CAN_DGN_OSTXT == "BILIARY STRICTURE OF TRANSPLANTED LIVER" |
+                        CAN_DGN_OSTXT == "ISCHEMIC CHOLANGO" | 
+                        CAN_DGN_OSTXT == "RECURRENT CHOLANGITIS/BILIARY STRICTURES" | 
+                        CAN_DGN_OSTXT == "ISCHEMIC CHOLANGIO" | 
+                        CAN_DGN_OSTXT == "K75.89 ISHEMIC CHOLANGIOPATHY" |
+                        CAN_DGN_OSTXT == "CHOLESTATIC LIVER DISEASE- ISCHEMIC CHOLANGIOPATHY" |
+                        CAN_DGN_OSTXT == "ISCHEMIC BILE DUCT DISEASE" | 
+                        CAN_DGN_OSTXT == "ISCHEMIC CHOLANGIOPATHY W/ INFECTED BILOMAS" |
+                        CAN_DGN_OSTXT == "RECURRENT ISCHEMIC CHOLANGITIS" | 
+                        CAN_DGN_OSTXT == "ISCHEMIC CHOLANGIOPATHY K83.8" | 
+                        CAN_DGN_OSTXT == "RECURRENT CHOLANGITIS" |
+                        CAN_DGN_OSTXT == "RECURRENT CHOLANGITIS S/P OLTX" |
+                        CAN_DGN_OSTXT == "ISCHEMIC CHOLANGIOPATHY K75.89"), 1000, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 & 
+                       (CAN_DGN_OSTXT == "FACTOR II DEFICIENCY" |
+                        CAN_DGN_OSTXT == "ORNITHINE TRANSCARBAMYLASE DEFICIENCY" |
+                        CAN_DGN_OSTXT == "COMPENSATED LIVER CIRRHOSIS 2ND TO WILSON'S DISEAS" |
+                        CAN_DGN_OSTXT == "ERYTHROPOIETIC PROTOPORPHYRIA" | 
+                        CAN_DGN_OSTXT == "GLYCOGEN STORAGE DISEASE I" | 
+                        CAN_DGN_OSTXT == "FAMILIAL RENAL AMYLOIDS FIBRINOGEN A ALPHA CHAIN" | 
+                        CAN_DGN_OSTXT == "MNGIE SYNDROME" | 
+                        CAN_DGN_OSTXT == "MNGIE" | 
+                        CAN_DGN_OSTXT == "MITOCHONDRIAL NEUROGASTROINTESTINAL ENCEPHALOPATHY" | 
+                        CAN_DGN_OSTXT == "CARBAMOYL PHOSPHATE DEFICIENCY" | 
+                        CAN_DGN_OSTXT == "PROPIONIC ACIDEMIA" | 
+                        CAN_DGN_OSTXT == "ORNITHINE TRANSCARBAMYLASE DEFICIENCY" | 
+                        CAN_DGN_OSTXT == "OMITHINE TRANSCARBAMYLASE DEFICIENCY" | 
+                        CAN_DGN_OSTXT == "ACUTE INTERMITTENT PORPHYRIA" | 
+                        CAN_DGN_OSTXT == "VON GIERKE DISEASE" |
+                        CAN_DGN_OSTXT == "HYPERCHOLESTEROLEMIA" |
+                        CAN_DGN_OSTXT == "FBP: PSEUDO-OBSTRUCTION MYOPATHIC" | 
+                        CAN_DGN_OSTXT == "NOONAN'S SYNDROME" | 
+                        CAN_DGN_OSTXT == "GLYCOGEN STORAGE DISEASE" | 
+                        CAN_DGN_OSTXT == "MAHVASH DISEASE"), 4315, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 & 
+                       (CAN_DGN_OSTXT == "NECROSIS IN SETTING OF ACUTE AUTOIMMUNE HEPATITIS" |
+                        CAN_DGN_OSTXT == "CHRONIC AUTOIMMUNE HEPATITIS" |
+                        CAN_DGN_OSTXT == "AUTOIMMUNE HEPATITIS^09" |
+                        CAN_DGN_OSTXT == "AUTOIMMUNE HEPATITIS / PBC OVERLAP" | 
+                        CAN_DGN_OSTXT == "AUTOIMMUNE HEPATITIS" | 
+                        CAN_DGN_OSTXT == "AUTOIMMUNE CHOLESTATIC DISEASE" | 
+                        CAN_DGN_OSTXT == "AUTOIMMUNE CHOLANGITIS WITH CIRRHOSIS" | 
+                        CAN_DGN_OSTXT == "AUTOIMMUNE CHOLANGITIS" | 
+                        CAN_DGN_OSTXT == "AUTOIMMUNE CHOLANGIOPATHY" | 
+                        CAN_DGN_OSTXT == "AIH AUTOIMMUNE (POSITIVE ANA, SMA AT OSH)" | 
+                        CAN_DGN_OSTXT == "AUTOIMMUNE"), 4212, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 & 
+                       (CAN_DGN_OSTXT == "PSC" |
+                        CAN_DGN_OSTXT == "RECURRENT PSC" |
+                        CAN_DGN_OSTXT == "PRIMARY SCLEROSING CHOLANGITIS" |
+                        CAN_DGN_OSTXT == "RIMARY SCLEROSING CHOLANGITIS: NO BOWEL DISEASE"), 4245, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 & 
+                       (CAN_DGN_OSTXT == "HEPATOCELLULAR CARCINOMA" |
+                        CAN_DGN_OSTXT == "PRIMARY LIVER MALIGNANCY: HEPATOMA, HEPATOCELLULAR" |
+                        CAN_DGN_OSTXT == "HCC"), 4400, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 & 
+                       (CAN_DGN_OSTXT == "CHOLANGIOCARCINOMA"), 4420, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 &
+                       (CAN_DGN_OSTXT == "HEREDITARY HEMOCHROMATOSIS TELANGIECTASIA" |
+                        CAN_DGN_OSTXT == "HEREDITARY HEMORRHAGIC TELANGIECTASIS" |
+                        CAN_DGN_OSTXT == "HHT (HEREDITARY HEMORRHAGIC TELANGIECTASIA)" |
+                        CAN_DGN_OSTXT == "HEREDITARY HEMORRHAGIC TELANGIECTASIA" | 
+                        CAN_DGN_OSTXT == "HEREDITARY HEMMORRHAGIC TELANGIECTASIAS" |
+                        CAN_DGN_OSTXT == "HEMORRHAGIC TELANGIECTASIA" |
+                        CAN_DGN_OSTXT == "HEREDITARY HEMORRHAGI" |
+                        CAN_DGN_OSTXT == "HHT" |
+                        CAN_DGN_OSTXT == "HEREDITARY HEMORRHAGIC TELENGECTASIS" |
+                        CAN_DGN_OSTXT == "HIV/MULTOPLE AVM'S" |
+                        CAN_DGN_OSTXT == "HEREDITARY HEMORRHAGIC TELANGIECTASIS"), 1001, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 &
+                       (CAN_DGN_OSTXT == "HEPATIC ARTERY THROMBOSIS/BILIARY STRICTURE" |
+                        CAN_DGN_OSTXT == "HEPATIC ARTERY THROMBOSIS" |
+                        CAN_DGN_OSTXT == "HAT" |
+                        CAN_DGN_OSTXT == "HA ANEURYSM" |
+                        CAN_DGN_OSTXT == "VASCULAR COMPROMISE, THROMBOSIS OF HA AND PV" | 
+                        CAN_DGN_OSTXT == "HAT/POST-TRANSPLANT ISCHEMIC CHOLANGIOPATHY" |
+                        CAN_DGN_OSTXT == "HEPATIC ARTERY THROMBOSIS OF TRANSPLANTED LIVER" |
+                        CAN_DGN_OSTXT == "S/P LIVER TRANSPLANT; PUTURED HEPATIC ARTERY" |
+                        CAN_DGN_OSTXT == "LATE HEPATIC ARTERY THROMBOSIS, RECURRENT" |
+                        CAN_DGN_OSTXT == "HEPATIC  ARTERY OCCLUSION"), 1002, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 &
+                       (CAN_DGN_OSTXT == "DELAYED GRAFT FUNCTION" |
+                        CAN_DGN_OSTXT == "RETRANSPLANT" |
+                        CAN_DGN_OSTXT == "PSEUDO-ANEURYSM WITH HEPATIC NECROSIS" |
+                        CAN_DGN_OSTXT == "REJECTION" |
+                        CAN_DGN_OSTXT == "BILE DUCT INJURY" | 
+                        CAN_DGN_OSTXT == "CHRONIC REJECTION" |
+                        CAN_DGN_OSTXT == "CHRONIC DUCTOPENIC REJECTION" |
+                        CAN_DGN_OSTXT == "ACUTE CELLULAR REJECTION" |
+                        CAN_DGN_OSTXT == "RE-TRANSPLANT/ GRAFT FAILURE" |
+                        CAN_DGN_OSTXT == "GRAFT NECROSIS" |
+                        CAN_DGN_OSTXT == "GRAFT DYSFUNCTION, HEPATIC VEIN STENOSIS" |
+                        CAN_DGN_OSTXT == "GRAFT DYSFUNCTION"), 1003, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 &
+                       (CAN_DGN_OSTXT == "SEC. SCLEROSING CHOLANGITIS" |
+                        CAN_DGN_OSTXT == "SECONDARY SCLEROSING CHOLANGITIS" |
+                        CAN_DGN_OSTXT == "CHRONIC BILIARY OBSTRUCTION" |
+                        CAN_DGN_OSTXT == "CHOLESTATIC COMPLICATIONS POST COVID"), 4260, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 &
+                       (CAN_DGN_OSTXT == "HCV CIRRHOSIS" |
+                        CAN_DGN_OSTXT == "HEPATITIS C" |
+                        CAN_DGN_OSTXT == "HCV" |
+                        CAN_DGN_OSTXT == "HEP C" |
+                        CAN_DGN_OSTXT == "DECOMPENSATED HCV CIRRHOSIS"), 4204, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN_OSTXT == "RECTAL ADENOCARCINOMA WITH METS TO LIVER" |
+                       CAN_DGN_OSTXT == "NEUROENDOCRINE TUMOR WITH METASTASES TO LIVER" |
+                       CAN_DGN_OSTXT == "NEUROENDOCRINE TUMOR" |
+                       CAN_DGN_OSTXT == "NEUROENODCRINE TUMOR" |
+                       CAN_DGN_OSTXT == "METASTATIC NEUROENDOCRINE TUMOR" |
+                       CAN_DGN_OSTXT == "METASTATIC PANCREATIC NEUROENDOCRINE TUMOR" |
+                       CAN_DGN_OSTXT == "METASTATIC CARCINOID TUMOR" | 
+                       CAN_DGN_OSTXT == "MALIGNANT NEUROENDOCRINE TUMOR" | 
+                       CAN_DGN_OSTXT == "NEURO ENDOCRINE  TUMOR" |
+                       CAN_DGN_OSTXT == "NEURO ENDOCRINE TUMOR" | 
+                       CAN_DGN_OSTXT == "NEUROENDOCRINE TUMOR OF LIVER" | 
+                       CAN_DGN_OSTXT == "NET" |
+                       CAN_DGN_OSTXT == "LIVER METASTASIS NEUROENDOCRINO TUMOR" | 
+                       CAN_DGN_OSTXT == "NEUROENDOCRINE TUMOR METASTASZIED TO LIVER" | 
+                       CAN_DGN_OSTXT == "METASTATID NEUROENDOCRINE TUMOR" | 
+                       CAN_DGN_OSTXT == "MALIGNANT CARCINOID TUMOR OF COLON" | 
+                       CAN_DGN_OSTXT == "LIVER METS FROM PRIMARY NEUROENDOCINE TUMOR" |
+                       CAN_DGN_OSTXT == "LIVER METS FROM PRIMARY NEUROENDOCRINE TUMOR" | 
+                       CAN_DGN_OSTXT == "PRIMARY PANCREATIC NEUROENDOCRINE TUMOR" |
+                       CAN_DGN_OSTXT == "NET METS" |
+                       CAN_DGN_OSTXT == "MULTIFOCAL METASTATIC ADENOCAR" |
+                       CAN_DGN_OSTXT == "METASTATIC SIGMOID CANCER TO THE LIVER" |
+                       CAN_DGN_OSTXT == "METASTATIC MALIGNANT NEUROENDOCRINE TUMOR TO LIVER" | 
+                       CAN_DGN_OSTXT == "METASTATIC COLORECTAL CANCER, CHOLANIOPATHY" | 
+                       CAN_DGN_OSTXT == "METASTATIC COLORECTAL CANCER TO THE LIVER" | 
+                       CAN_DGN_OSTXT == "METASTATIC COLORECTAL CANCER" | 
+                       CAN_DGN_OSTXT == "METASTATIC COLON CANCER TO THE LIVER" | 
+                       CAN_DGN_OSTXT == "METASTATIC COLON CANCER" | 
+                       CAN_DGN_OSTXT == "METASTATIC ACINIC CELL CARCINOMA" | 
+                       CAN_DGN_OSTXT == "LIVER ONLY METASTASIS FROM COLON CANCER" | 
+                       CAN_DGN_OSTXT == "GIST WITH METASTASIS TO LIVER" | 
+                       CAN_DGN_OSTXT == "CRC WITH LIVER METS" | 
+                       CAN_DGN_OSTXT == "COLORECTAL LIVER METASTASIS" | 
+                       CAN_DGN_OSTXT == "COLORECTAL CANCER WITH METS TO YHE LIVER" |
+                       CAN_DGN_OSTXT == "COLORECTAL CANCER WITH LIVER METS" |
+                       CAN_DGN_OSTXT == "COLORECTAL CA WITH METS TO LIVER" | 
+                       CAN_DGN_OSTXT == "COLORECTAL CA WITH LIVER METS" | 
+                       CAN_DGN_OSTXT == "COLON CANCER WITH METS TO THE LIVER" | 
+                       CAN_DGN_OSTXT == "COLON CANCER WITH METS TO LIVER" | 
+                       CAN_DGN_OSTXT == "COLON CANCER WITH LIVER METASTASIS" |
+                       CAN_DGN_OSTXT == "COLON CANCER W METS TO THE LIVER" |
+                       CAN_DGN_OSTXT == "NEUROENDOCRINE TUMOR" |
+                       CAN_DGN_OSTXT == "NEUROENDOCRINE TUMOR" | 
+                       CAN_DGN_OSTXT == "NEUROENDOCRINE/CARINOID" | 
+                       CAN_DGN_OSTXT == "NET" | 
+                       CAN_DGN_OSTXT == "COLORECTAL" | 
+                       CAN_DGN_OSTXT == "METASTATIC NET" | 
+                       CAN_DGN_OSTXT == "PSEUDOPAPILLARY NEOPLASM OF THE PANCREAS" | 
+                       CAN_DGN_OSTXT == "COLON ADENOCARCINOMA" | 
+                       CAN_DGN_OSTXT == "NEUROENDOCTINE TUMOR" | 
+                       CAN_DGN_OSTXT == "NEUROENDOCRINE TUMOR" | 
+                       CAN_DGN_OSTXT == "NEUROENDOCRINE LIVER METS" | 
+                       CAN_DGN_OSTXT == "NEUROENDOCRINE" | 
+                       CAN_DGN_OSTXT == "COLORECTAL LIVER METASTASES" |
+                       CAN_DGN_OSTXT == "COLORECTAL WITH METS TO LIVER" |
+                       CAN_DGN_OSTXT == "GI STROMAL TUMOR OF STOMACH" | 
+                       CAN_DGN_OSTXT == "NEUROENDOCRINE CARCINOID TUMOR/PANCREATIC ORIGIN" | 
+                       CAN_DGN_OSTXT == "RECTAL NET" | 
+                       CAN_DGN_OSTXT == "WELL DIFFERENTIATED NEUROENDOCRINE TUMOR METASTATI" | 
+                       CAN_DGN_OSTXT == "COLON CANCER WITH METASTASIS TO LIVER" |
+                       CAN_DGN_OSTXT == "COLORECTAL METASTASES" |
+                       CAN_DGN_OSTXT == "COLORECTAL CANCER" | 
+                       CAN_DGN_OSTXT == "NEUROENDOCRINE TUMOR WITH METASTASIS TO THE LIVER" | 
+                       CAN_DGN_OSTXT == "COLORECTAL CANCER" | 
+                       CAN_DGN_OSTXT == "COLON CANCER" | 
+                       CAN_DGN_OSTXT == "COLO-RECTAL WITH METS", 1005, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 & 
+                       (CAN_DGN_OSTXT == "EPITHELIOID HEMANGIOENDOTHELIOMA" |
+                          CAN_DGN_OSTXT == "SOLITARY FIBROUS SARCOMA" |
+                          CAN_DGN_OSTXT == "HEMANGIOENDOTHELIAL SARCOMA" |
+                          CAN_DGN_OSTXT == "HEPATIC HEMOANGIOMAS" |
+                          CAN_DGN_OSTXT == "HEPATIC EPITHELIOID HEMANGIOENDOTHELIOMAS" |
+                          CAN_DGN_OSTXT == "HEPATIC ADENOMA" | 
+                          CAN_DGN_OSTXT == "EPITHELIOD  ANGIOMYOLIPOMA" | 
+                          CAN_DGN_OSTXT == "DONOR METASTATIC MALIGNANT MELANOMA" | 
+                          CAN_DGN_OSTXT == "INTRADUCTAL PAPILLARY NEOPLASM OF BILE DUCT" | 
+                          CAN_DGN_OSTXT == "HEPATIC HEMANGIOMA" | 
+                          CAN_DGN_OSTXT == "HEPATIC HEMANGIOMAS" | 
+                          CAN_DGN_OSTXT == "EPITHELIOID HEMANGIOENDOTHELIOMA" | 
+                          CAN_DGN_OSTXT == "ACINAR CELL CARCINOMA- PRIMARY LIVER" | 
+                          CAN_DGN_OSTXT == "HEPATIC EPITHELIOID HEMANGIOENDOTHELIOMAS" | 
+                          CAN_DGN_OSTXT == "HEPATIC EPITHELIOID HEMANGIOENDOTHELIOMA" | 
+                          CAN_DGN_OSTXT == "EPITHELIOID ANGIOMYOLIPOMA" | 
+                          CAN_DGN_OSTXT == "METASTTIC EPITHELIOID HEMANGOENDOTHELIOMA" |
+                          CAN_DGN_OSTXT == "GIANT HEMANGIOMA" |
+                          CAN_DGN_OSTXT == "HEMANGIOMA" | 
+                          CAN_DGN_OSTXT == "HEPATIC ENDOTHELIOID HEMANGIOENDOTHELIOMA" | 
+                          CAN_DGN_OSTXT == "EMBRYONAL SARCOMA OF THE LIVER" | 
+                          CAN_DGN_OSTXT == "DESMOPLASTIC SMALL ROUND CELL TUMOR" | 
+                          CAN_DGN_OSTXT == "MULTIPLE HEPATIC ADENOMAS" | 
+                          CAN_DGN_OSTXT == "HEPATIC HEMANGIOMA"), 4405, CAN_DGN))
+
+
+timeseriesdata <- timeseriesdata %>% mutate(
+  diagnosis = case_when(
+    CAN_DGN == 4400 | CAN_DGN == 4401 ~ "Hepatocellular Carcinoma",
+    CAN_DGN == 4403 | CAN_DGN == 4420 ~ "Cholangiocarcinoma",
+    CAN_DGN == 4451 ~ "Polycystic Liver Disease",
+    CAN_DGN == 4104 | CAN_DGN == 4106 | CAN_DGN == 4204 | CAN_DGN == 4206 ~ "Hepatitis C",
+    CAN_DGN >= 4215 & CAN_DGN <= 4219 ~ "Alcohol-Associated Liver Disease",
+    CAN_DGN >= 4240 & CAN_DGN <= 4245 ~ "Primary Sclerosing Cholangitis",
+    CAN_DGN >= 4300 & CAN_DGN <= 4315 ~ "Metabolic Disease",
+    CAN_DGN == 4102 | CAN_DGN == 4107 | CAN_DGN == 4202 | CAN_DGN == 4207 ~ "Hepatitis B",
+    CAN_DGN == 1005 ~ "Liver Metastases from Other Primary",
+    CAN_DGN == 4430 | CAN_DGN == 4402 | CAN_DGN == 4404 | CAN_DGN == 4405 | CAN_DGN == 4410 | CAN_DGN == 4450 | CAN_DGN == 4455 ~ "Other Primary Liver Malignancy",
+    CAN_DGN == 4220 ~ "Primary Biliary Cirrhosis",
+    CAN_DGN == 4214 ~ "Metabolic Dysfunction-Associated Steatotic Liver Disease",
+    CAN_DGN == 4208 | CAN_DGN == 4209 | CAN_DGN == 4210 | CAN_DGN == 4213 ~ "Idiopathic Cirrhosis",
+    CAN_DGN == 4212 ~ "Autoimmune Hepatitis",
+    CAN_DGN == 1000 | CAN_DGN == 1002 | CAN_DGN == 1003 ~ "Liver Transplant Complications",
+    CAN_DGN == 1001 ~ "Vascular Malformations",
+    (CAN_DGN >= 4250 & CAN_DGN <= 4275) | (CAN_DGN >= 4230 & CAN_DGN <= 4235) ~ "Other Cholestatic Liver Disease",
+    TRUE ~ "Other"),
+  diagnosis = factor(diagnosis, levels = c("Hepatocellular Carcinoma", "Cholangiocarcinoma", "Other Primary Liver Malignancy",
+                                           "Liver Metastases from Other Primary", "Alcohol-Associated Liver Disease", 
+                                           "Metabolic Dysfunction-Associated Steatotic Liver Disease",
+                                           "Hepatitis C", "Hepatitis B", "Polycystic Liver Disease", "Primary Sclerosing Cholangitis",
+                                           "Primary Biliary Cirrhosis", "Idiopathic Cirrhosis", "Autoimmune Hepatitis",
+                                           "Other Cholestatic Liver Disease", "Liver Transplant Complications", "Metabolic Disease",
+                                           "Vascular Malformations", "Other"))
+)
+
+
+#Final longitudinal dataset
+
+finaldataset <- finaldataset %>%
+  mutate(
+    CAN_DGN = ifelse(CAN_DGN == 999 &
+                       (CAN_DGN_OSTXT == "POLYCYSTIC LIVER DISEASE" |
+                          CAN_DGN_OSTXT == "PCLD/PCKD" |
+                          CAN_DGN_OSTXT == "POLYCYSTIC LIVER AND KIDNEY DISEASE" |
+                          CAN_DGN_OSTXT == "POLYCYSTIC LIVER" | 
+                          CAN_DGN_OSTXT == "POLYCYSTIC KIDNEYS" |
+                          CAN_DGN_OSTXT == "POLYCYSTIC LIVER / KIDNEY" |
+                          CAN_DGN_OSTXT == "POLYCYSTIC KIDNEY DISEASE" |
+                          CAN_DGN_OSTXT == "POLYCYSTIC DISEASE" |
+                          CAN_DGN_OSTXT == "POLYCYCTIC LIVER" | 
+                          CAN_DGN_OSTXT == "AUTOSOMAL DOMINANT POLYCYSTIC LIVER DISEASE?" |  
+                          CAN_DGN_OSTXT == "POLYCYSTIC LIVER AND KIDNEY"), 4451, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 &
+                       (CAN_DGN_OSTXT == "NASH" |
+                          CAN_DGN_OSTXT == "NAFLD"), 4214, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 & 
+                       (CAN_DGN_OSTXT == "CYSTIC FIBROSIS" |
+                          CAN_DGN_OSTXT == "CYSTIC FIBROSIS - LIVER"), 4285, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 & 
+                       (CAN_DGN_OSTXT == "ISCHEMIC CHOLANGIOPATHY" |
+                          CAN_DGN_OSTXT == "ISCHEMIC CHOLANGITIS" |
+                          CAN_DGN_OSTXT == "DIFFUSE ISCHEMIC CHOLANGIOPATHY" |
+                          CAN_DGN_OSTXT == "POST OLT BILIARY STRICTURES" | 
+                          CAN_DGN_OSTXT == "ALLOGRAFT FAILURE FROM ISCHEMIC CHOLANGIOPATHY" | 
+                          CAN_DGN_OSTXT == "ISCHEMIC INJURY" | 
+                          CAN_DGN_OSTXT == "DIFFUSE CHOLANGIOPATHY" | 
+                          CAN_DGN_OSTXT == "BILIARY STRICTURES/CHOLANGIOPATHY" | 
+                          CAN_DGN_OSTXT == "ISCHEMIC CHOLANGIOPATHY POST LIVER TRANSPLANT" | 
+                          CAN_DGN_OSTXT == "RECURRENT CHOLANGITIS/BILIARY STRICTURES" | 
+                          CAN_DGN_OSTXT == "ISCHEMIC CHOLANGIO" | 
+                          CAN_DGN_OSTXT == "ISCHEMIC BILE DUCT DISEASE" | 
+                          CAN_DGN_OSTXT == "RECURRENT ISCHEMIC CHOLANGITIS" | 
+                          CAN_DGN_OSTXT == "ISCHEMIC CHOLANGIOPATHY K83.8" | 
+                          CAN_DGN_OSTXT == "RECURRENT CHOLANGITIS" |
+                          CAN_DGN_OSTXT == "RECURRENT CHOLANGITIS S/P OLTX" |
+                          CAN_DGN_OSTXT == "BILIARY CHOLANGIOPATHY" | 
+                          CAN_DGN_OSTXT == "CHOLANGIOPATHY, RECURRENT CHOLANGITIS" | 
+                          CAN_DGN_OSTXT == "ISCHEMIC CHOLANGIO" | 
+                          CAN_DGN_OSTXT == "PERSISTENT BILIARY STRICTURE" | 
+                          CAN_DGN_OSTXT == "BILIARY STRICTURES" | 
+                          CAN_DGN_OSTXT == "ISCHEMIC BILIOPATHY S/P OLT AUGUST 2017" | 
+                          CAN_DGN_OSTXT == "ISCHEMIC CHOLANGIOPATHY OF TRANSPLANTED LIVER" |
+                          CAN_DGN_OSTXT == "BILIARY STRICTURE OF TRANSPLANTED LIVER" |
+                          CAN_DGN_OSTXT == "ISCHEMIC CHOLANGO" | 
+                          CAN_DGN_OSTXT == "RECURRENT CHOLANGITIS/BILIARY STRICTURES" | 
+                          CAN_DGN_OSTXT == "ISCHEMIC CHOLANGIO" | 
+                          CAN_DGN_OSTXT == "K75.89 ISHEMIC CHOLANGIOPATHY" |
+                          CAN_DGN_OSTXT == "CHOLESTATIC LIVER DISEASE- ISCHEMIC CHOLANGIOPATHY" |
+                          CAN_DGN_OSTXT == "ISCHEMIC BILE DUCT DISEASE" | 
+                          CAN_DGN_OSTXT == "ISCHEMIC CHOLANGIOPATHY W/ INFECTED BILOMAS" |
+                          CAN_DGN_OSTXT == "RECURRENT ISCHEMIC CHOLANGITIS" | 
+                          CAN_DGN_OSTXT == "ISCHEMIC CHOLANGIOPATHY K83.8" | 
+                          CAN_DGN_OSTXT == "RECURRENT CHOLANGITIS" |
+                          CAN_DGN_OSTXT == "RECURRENT CHOLANGITIS S/P OLTX" |
+                          CAN_DGN_OSTXT == "ISCHEMIC CHOLANGIOPATHY K75.89"), 1000, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 & 
+                       (CAN_DGN_OSTXT == "FACTOR II DEFICIENCY" |
+                          CAN_DGN_OSTXT == "ORNITHINE TRANSCARBAMYLASE DEFICIENCY" |
+                          CAN_DGN_OSTXT == "COMPENSATED LIVER CIRRHOSIS 2ND TO WILSON'S DISEAS" |
+                          CAN_DGN_OSTXT == "ERYTHROPOIETIC PROTOPORPHYRIA" | 
+                          CAN_DGN_OSTXT == "GLYCOGEN STORAGE DISEASE I" | 
+                          CAN_DGN_OSTXT == "FAMILIAL RENAL AMYLOIDS FIBRINOGEN A ALPHA CHAIN" | 
+                          CAN_DGN_OSTXT == "MNGIE SYNDROME" | 
+                          CAN_DGN_OSTXT == "MNGIE" | 
+                          CAN_DGN_OSTXT == "MITOCHONDRIAL NEUROGASTROINTESTINAL ENCEPHALOPATHY" | 
+                          CAN_DGN_OSTXT == "CARBAMOYL PHOSPHATE DEFICIENCY" | 
+                          CAN_DGN_OSTXT == "PROPIONIC ACIDEMIA" | 
+                          CAN_DGN_OSTXT == "ORNITHINE TRANSCARBAMYLASE DEFICIENCY" | 
+                          CAN_DGN_OSTXT == "OMITHINE TRANSCARBAMYLASE DEFICIENCY" | 
+                          CAN_DGN_OSTXT == "ACUTE INTERMITTENT PORPHYRIA" | 
+                          CAN_DGN_OSTXT == "VON GIERKE DISEASE" |
+                          CAN_DGN_OSTXT == "HYPERCHOLESTEROLEMIA" |
+                          CAN_DGN_OSTXT == "FBP: PSEUDO-OBSTRUCTION MYOPATHIC" | 
+                          CAN_DGN_OSTXT == "NOONAN'S SYNDROME" | 
+                          CAN_DGN_OSTXT == "GLYCOGEN STORAGE DISEASE" | 
+                          CAN_DGN_OSTXT == "MAHVASH DISEASE"), 4315, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 & 
+                       (CAN_DGN_OSTXT == "NECROSIS IN SETTING OF ACUTE AUTOIMMUNE HEPATITIS" |
+                          CAN_DGN_OSTXT == "CHRONIC AUTOIMMUNE HEPATITIS" |
+                          CAN_DGN_OSTXT == "AUTOIMMUNE HEPATITIS^09" |
+                          CAN_DGN_OSTXT == "AUTOIMMUNE HEPATITIS / PBC OVERLAP" | 
+                          CAN_DGN_OSTXT == "AUTOIMMUNE HEPATITIS" | 
+                          CAN_DGN_OSTXT == "AUTOIMMUNE CHOLESTATIC DISEASE" | 
+                          CAN_DGN_OSTXT == "AUTOIMMUNE CHOLANGITIS WITH CIRRHOSIS" | 
+                          CAN_DGN_OSTXT == "AUTOIMMUNE CHOLANGITIS" | 
+                          CAN_DGN_OSTXT == "AUTOIMMUNE CHOLANGIOPATHY" | 
+                          CAN_DGN_OSTXT == "AIH AUTOIMMUNE (POSITIVE ANA, SMA AT OSH)" | 
+                          CAN_DGN_OSTXT == "AUTOIMMUNE"), 4212, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 & 
+                       (CAN_DGN_OSTXT == "PSC" |
+                          CAN_DGN_OSTXT == "RECURRENT PSC" |
+                          CAN_DGN_OSTXT == "PRIMARY SCLEROSING CHOLANGITIS" |
+                          CAN_DGN_OSTXT == "RIMARY SCLEROSING CHOLANGITIS: NO BOWEL DISEASE"), 4245, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 & 
+                       (CAN_DGN_OSTXT == "HEPATOCELLULAR CARCINOMA" |
+                          CAN_DGN_OSTXT == "PRIMARY LIVER MALIGNANCY: HEPATOMA, HEPATOCELLULAR" |
+                          CAN_DGN_OSTXT == "HCC"), 4400, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 & 
+                       (CAN_DGN_OSTXT == "CHOLANGIOCARCINOMA"), 4420, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 &
+                       (CAN_DGN_OSTXT == "HEREDITARY HEMOCHROMATOSIS TELANGIECTASIA" |
+                          CAN_DGN_OSTXT == "HEREDITARY HEMORRHAGIC TELANGIECTASIS" |
+                          CAN_DGN_OSTXT == "HHT (HEREDITARY HEMORRHAGIC TELANGIECTASIA)" |
+                          CAN_DGN_OSTXT == "HEREDITARY HEMORRHAGIC TELANGIECTASIA" | 
+                          CAN_DGN_OSTXT == "HEREDITARY HEMMORRHAGIC TELANGIECTASIAS" |
+                          CAN_DGN_OSTXT == "HEMORRHAGIC TELANGIECTASIA" |
+                          CAN_DGN_OSTXT == "HEREDITARY HEMORRHAGI" |
+                          CAN_DGN_OSTXT == "HHT" |
+                          CAN_DGN_OSTXT == "HEREDITARY HEMORRHAGIC TELENGECTASIS" |
+                          CAN_DGN_OSTXT == "HIV/MULTOPLE AVM'S" |
+                          CAN_DGN_OSTXT == "HEREDITARY HEMORRHAGIC TELANGIECTASIS"), 1001, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 &
+                       (CAN_DGN_OSTXT == "HEPATIC ARTERY THROMBOSIS/BILIARY STRICTURE" |
+                          CAN_DGN_OSTXT == "HEPATIC ARTERY THROMBOSIS" |
+                          CAN_DGN_OSTXT == "HAT" |
+                          CAN_DGN_OSTXT == "HA ANEURYSM" |
+                          CAN_DGN_OSTXT == "VASCULAR COMPROMISE, THROMBOSIS OF HA AND PV" | 
+                          CAN_DGN_OSTXT == "HAT/POST-TRANSPLANT ISCHEMIC CHOLANGIOPATHY" |
+                          CAN_DGN_OSTXT == "HEPATIC ARTERY THROMBOSIS OF TRANSPLANTED LIVER" |
+                          CAN_DGN_OSTXT == "S/P LIVER TRANSPLANT; PUTURED HEPATIC ARTERY" |
+                          CAN_DGN_OSTXT == "LATE HEPATIC ARTERY THROMBOSIS, RECURRENT" |
+                          CAN_DGN_OSTXT == "HEPATIC  ARTERY OCCLUSION"), 1002, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 &
+                       (CAN_DGN_OSTXT == "DELAYED GRAFT FUNCTION" |
+                          CAN_DGN_OSTXT == "RETRANSPLANT" |
+                          CAN_DGN_OSTXT == "PSEUDO-ANEURYSM WITH HEPATIC NECROSIS" |
+                          CAN_DGN_OSTXT == "REJECTION" |
+                          CAN_DGN_OSTXT == "BILE DUCT INJURY" | 
+                          CAN_DGN_OSTXT == "CHRONIC REJECTION" |
+                          CAN_DGN_OSTXT == "CHRONIC DUCTOPENIC REJECTION" |
+                          CAN_DGN_OSTXT == "ACUTE CELLULAR REJECTION" |
+                          CAN_DGN_OSTXT == "RE-TRANSPLANT/ GRAFT FAILURE" |
+                          CAN_DGN_OSTXT == "GRAFT NECROSIS" |
+                          CAN_DGN_OSTXT == "GRAFT DYSFUNCTION, HEPATIC VEIN STENOSIS" |
+                          CAN_DGN_OSTXT == "GRAFT DYSFUNCTION"), 1003, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 &
+                       (CAN_DGN_OSTXT == "SEC. SCLEROSING CHOLANGITIS" |
+                          CAN_DGN_OSTXT == "SECONDARY SCLEROSING CHOLANGITIS" |
+                          CAN_DGN_OSTXT == "CHRONIC BILIARY OBSTRUCTION" |
+                          CAN_DGN_OSTXT == "CHOLESTATIC COMPLICATIONS POST COVID"), 4260, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 &
+                       (CAN_DGN_OSTXT == "HCV CIRRHOSIS" |
+                          CAN_DGN_OSTXT == "HEPATITIS C" |
+                          CAN_DGN_OSTXT == "HCV" |
+                          CAN_DGN_OSTXT == "HEP C" |
+                          CAN_DGN_OSTXT == "DECOMPENSATED HCV CIRRHOSIS"), 4204, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN_OSTXT == "RECTAL ADENOCARCINOMA WITH METS TO LIVER" |
+                          CAN_DGN_OSTXT == "NEUROENDOCRINE TUMOR WITH METASTASES TO LIVER" |
+                          CAN_DGN_OSTXT == "NEUROENDOCRINE TUMOR" |
+                          CAN_DGN_OSTXT == "NEUROENODCRINE TUMOR" |
+                          CAN_DGN_OSTXT == "METASTATIC NEUROENDOCRINE TUMOR" |
+                          CAN_DGN_OSTXT == "METASTATIC PANCREATIC NEUROENDOCRINE TUMOR" |
+                          CAN_DGN_OSTXT == "METASTATIC CARCINOID TUMOR" | 
+                          CAN_DGN_OSTXT == "MALIGNANT NEUROENDOCRINE TUMOR" | 
+                          CAN_DGN_OSTXT == "NEURO ENDOCRINE  TUMOR" |
+                          CAN_DGN_OSTXT == "NEURO ENDOCRINE TUMOR" | 
+                          CAN_DGN_OSTXT == "NEUROENDOCRINE TUMOR OF LIVER" | 
+                          CAN_DGN_OSTXT == "NET" |
+                          CAN_DGN_OSTXT == "LIVER METASTASIS NEUROENDOCRINO TUMOR" | 
+                          CAN_DGN_OSTXT == "NEUROENDOCRINE TUMOR METASTASZIED TO LIVER" | 
+                          CAN_DGN_OSTXT == "METASTATID NEUROENDOCRINE TUMOR" | 
+                          CAN_DGN_OSTXT == "MALIGNANT CARCINOID TUMOR OF COLON" | 
+                          CAN_DGN_OSTXT == "LIVER METS FROM PRIMARY NEUROENDOCINE TUMOR" |
+                          CAN_DGN_OSTXT == "LIVER METS FROM PRIMARY NEUROENDOCRINE TUMOR" | 
+                          CAN_DGN_OSTXT == "PRIMARY PANCREATIC NEUROENDOCRINE TUMOR" |
+                          CAN_DGN_OSTXT == "NET METS" |
+                          CAN_DGN_OSTXT == "MULTIFOCAL METASTATIC ADENOCAR" |
+                          CAN_DGN_OSTXT == "METASTATIC SIGMOID CANCER TO THE LIVER" |
+                          CAN_DGN_OSTXT == "METASTATIC MALIGNANT NEUROENDOCRINE TUMOR TO LIVER" | 
+                          CAN_DGN_OSTXT == "METASTATIC COLORECTAL CANCER, CHOLANIOPATHY" | 
+                          CAN_DGN_OSTXT == "METASTATIC COLORECTAL CANCER TO THE LIVER" | 
+                          CAN_DGN_OSTXT == "METASTATIC COLORECTAL CANCER" | 
+                          CAN_DGN_OSTXT == "METASTATIC COLON CANCER TO THE LIVER" | 
+                          CAN_DGN_OSTXT == "METASTATIC COLON CANCER" | 
+                          CAN_DGN_OSTXT == "METASTATIC ACINIC CELL CARCINOMA" | 
+                          CAN_DGN_OSTXT == "LIVER ONLY METASTASIS FROM COLON CANCER" | 
+                          CAN_DGN_OSTXT == "GIST WITH METASTASIS TO LIVER" | 
+                          CAN_DGN_OSTXT == "CRC WITH LIVER METS" | 
+                          CAN_DGN_OSTXT == "COLORECTAL LIVER METASTASIS" | 
+                          CAN_DGN_OSTXT == "COLORECTAL CANCER WITH METS TO YHE LIVER" |
+                          CAN_DGN_OSTXT == "COLORECTAL CANCER WITH LIVER METS" |
+                          CAN_DGN_OSTXT == "COLORECTAL CA WITH METS TO LIVER" | 
+                          CAN_DGN_OSTXT == "COLORECTAL CA WITH LIVER METS" | 
+                          CAN_DGN_OSTXT == "COLON CANCER WITH METS TO THE LIVER" | 
+                          CAN_DGN_OSTXT == "COLON CANCER WITH METS TO LIVER" | 
+                          CAN_DGN_OSTXT == "COLON CANCER WITH LIVER METASTASIS" |
+                          CAN_DGN_OSTXT == "COLON CANCER W METS TO THE LIVER" |
+                       CAN_DGN_OSTXT == "NEUROENDOCRINE TUMOR" |
+                       CAN_DGN_OSTXT == "NEUROENDOCRINE TUMOR" | 
+                       CAN_DGN_OSTXT == "NEUROENDOCRINE/CARINOID" | 
+                       CAN_DGN_OSTXT == "NET" | 
+                       CAN_DGN_OSTXT == "COLORECTAL" | 
+                       CAN_DGN_OSTXT == "METASTATIC NET" | 
+                       CAN_DGN_OSTXT == "PSEUDOPAPILLARY NEOPLASM OF THE PANCREAS" | 
+                       CAN_DGN_OSTXT == "COLON ADENOCARCINOMA" | 
+                       CAN_DGN_OSTXT == "NEUROENDOCTINE TUMOR" | 
+                       CAN_DGN_OSTXT == "NEUROENDOCRINE TUMOR" | 
+                       CAN_DGN_OSTXT == "NEUROENDOCRINE LIVER METS" | 
+                       CAN_DGN_OSTXT == "NEUROENDOCRINE" | 
+                       CAN_DGN_OSTXT == "COLORECTAL LIVER METASTASES" |
+                       CAN_DGN_OSTXT == "COLORECTAL WITH METS TO LIVER" |
+                       CAN_DGN_OSTXT == "GI STROMAL TUMOR OF STOMACH" | 
+                       CAN_DGN_OSTXT == "NEUROENDOCRINE CARCINOID TUMOR/PANCREATIC ORIGIN" | 
+                       CAN_DGN_OSTXT == "RECTAL NET" | 
+                       CAN_DGN_OSTXT == "WELL DIFFERENTIATED NEUROENDOCRINE TUMOR METASTATI" | 
+                       CAN_DGN_OSTXT == "COLON CANCER WITH METASTASIS TO LIVER" |
+                       CAN_DGN_OSTXT == "COLORECTAL METASTASES" |
+                       CAN_DGN_OSTXT == "COLORECTAL CANCER" | 
+                       CAN_DGN_OSTXT == "NEUROENDOCRINE TUMOR WITH METASTASIS TO THE LIVER" | 
+                       CAN_DGN_OSTXT == "COLORECTAL CANCER" | 
+                       CAN_DGN_OSTXT == "COLON CANCER" | 
+                          CAN_DGN_OSTXT == "COLO-RECTAL WITH METS", 1005, CAN_DGN),
+    CAN_DGN = ifelse(CAN_DGN == 999 & 
+                       (CAN_DGN_OSTXT == "EPITHELIOID HEMANGIOENDOTHELIOMA" |
+                          CAN_DGN_OSTXT == "SOLITARY FIBROUS SARCOMA" |
+                          CAN_DGN_OSTXT == "HEMANGIOENDOTHELIAL SARCOMA" |
+                          CAN_DGN_OSTXT == "HEPATIC HEMOANGIOMAS" |
+                          CAN_DGN_OSTXT == "HEPATIC EPITHELIOID HEMANGIOENDOTHELIOMAS" |
+                          CAN_DGN_OSTXT == "HEPATIC ADENOMA" | 
+                          CAN_DGN_OSTXT == "EPITHELIOD  ANGIOMYOLIPOMA" | 
+                          CAN_DGN_OSTXT == "DONOR METASTATIC MALIGNANT MELANOMA" | 
+                          CAN_DGN_OSTXT == "INTRADUCTAL PAPILLARY NEOPLASM OF BILE DUCT" | 
+                          CAN_DGN_OSTXT == "HEPATIC HEMANGIOMA" | 
+                          CAN_DGN_OSTXT == "HEPATIC HEMANGIOMAS" | 
+                          CAN_DGN_OSTXT == "EPITHELIOID HEMANGIOENDOTHELIOMA" | 
+                          CAN_DGN_OSTXT == "ACINAR CELL CARCINOMA- PRIMARY LIVER" | 
+                          CAN_DGN_OSTXT == "HEPATIC EPITHELIOID HEMANGIOENDOTHELIOMAS" | 
+                          CAN_DGN_OSTXT == "HEPATIC EPITHELIOID HEMANGIOENDOTHELIOMA" | 
+                          CAN_DGN_OSTXT == "EPITHELIOID ANGIOMYOLIPOMA" | 
+                          CAN_DGN_OSTXT == "METASTTIC EPITHELIOID HEMANGOENDOTHELIOMA" |
+                          CAN_DGN_OSTXT == "GIANT HEMANGIOMA" |
+                          CAN_DGN_OSTXT == "HEMANGIOMA" | 
+                          CAN_DGN_OSTXT == "HEPATIC ENDOTHELIOID HEMANGIOENDOTHELIOMA" | 
+                          CAN_DGN_OSTXT == "EMBRYONAL SARCOMA OF THE LIVER" | 
+                          CAN_DGN_OSTXT == "DESMOPLASTIC SMALL ROUND CELL TUMOR" | 
+                          CAN_DGN_OSTXT == "MULTIPLE HEPATIC ADENOMAS" | 
+                          CAN_DGN_OSTXT == "HEPATIC HEMANGIOMA"), 4405, CAN_DGN))
+
+#Final dataset with just one observation per patient
+
+finaldataset <- finaldataset %>% mutate(
+  diagnosis = case_when(
+    CAN_DGN == 4400 | CAN_DGN == 4401 ~ "Hepatocellular Carcinoma",
+    CAN_DGN == 4403 | CAN_DGN == 4420 ~ "Cholangiocarcinoma",
+    CAN_DGN == 4451 ~ "Polycystic Liver Disease",
+    CAN_DGN == 4104 | CAN_DGN == 4106 | CAN_DGN == 4204 | CAN_DGN == 4206 ~ "Hepatitis C",
+    CAN_DGN >= 4215 & CAN_DGN <= 4219 ~ "Alcohol-Associated Liver Disease",
+    CAN_DGN >= 4240 & CAN_DGN <= 4245 ~ "Primary Sclerosing Cholangitis",
+    CAN_DGN >= 4300 & CAN_DGN <= 4315 ~ "Metabolic Disease",
+    CAN_DGN == 4102 | CAN_DGN == 4107 | CAN_DGN == 4202 | CAN_DGN == 4207 ~ "Hepatitis B",
+    CAN_DGN == 1005 ~ "Liver Metastases from Other Primary",
+    CAN_DGN == 4430 | CAN_DGN == 4402 | CAN_DGN == 4404 | CAN_DGN == 4405 | CAN_DGN == 4410 | CAN_DGN == 4450 | CAN_DGN == 4455 ~ "Other Primary Liver Malignancy",
+    CAN_DGN == 4220 ~ "Primary Biliary Cirrhosis",
+    CAN_DGN == 4214 ~ "Metabolic Dysfunction-Associated Steatotic Liver Disease",
+    CAN_DGN == 4208 | CAN_DGN == 4209 | CAN_DGN == 4210 | CAN_DGN == 4213 ~ "Idiopathic Cirrhosis",
+    CAN_DGN == 4212 ~ "Autoimmune Hepatitis",
+    CAN_DGN == 1000 | CAN_DGN == 1002 | CAN_DGN == 1003 ~ "Liver Transplant Complications",
+    CAN_DGN == 1001 ~ "Vascular Malformations",
+    (CAN_DGN >= 4250 & CAN_DGN <= 4275) | (CAN_DGN >= 4230 & CAN_DGN <= 4235) ~ "Other Cholestatic Liver Disease",
+    TRUE ~ "Other"),
+  diagnosis = factor(diagnosis, levels = c("Alcohol-Associated Liver Disease", "Hepatocellular Carcinoma",
+                                           "Metabolic Dysfunction-Associated Steatotic Liver Disease",
+                                           "Liver Metastases from Other Primary",
+                                           "Hepatitis C", "Hepatitis B", "Polycystic Liver Disease", "Primary Sclerosing Cholangitis",
+                                           "Primary Biliary Cirrhosis", "Idiopathic Cirrhosis", "Autoimmune Hepatitis",
+                                           "Other Cholestatic Liver Disease", "Liver Transplant Complications", "Metabolic Disease",
+                                           "Cholangiocarcinoma", "Other Primary Liver Malignancy", "Vascular Malformations", "Other")))
+
+
+
+```
+
+```{r nlrb cohorts}
+
+
+precohort <- timeseriesdata %>% filter(POLICY_COHORT == "Pre-Policy")
+
+
+
+```
